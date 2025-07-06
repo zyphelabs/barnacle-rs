@@ -6,24 +6,24 @@ use axum::{
 };
 use barnacle_rs::{BarnacleError, FromBarnacleError};
 use serde_json::json;
-use thiserror::Error;
 use std::collections::HashMap;
+use thiserror::Error;
 
 /// Example of an application-specific error enum that can convert from BarnacleError
 #[derive(Error, Debug)]
 pub enum AppError {
     #[error("Authentication failed: {0}")]
     Authentication(String),
-    
+
     #[error("Rate limiting error: {0}")]
     RateLimit(#[from] BarnacleError),
-    
+
     #[error("Database error: {message}")]
     Database { message: String },
-    
+
     #[error("Validation error: {0}")]
     Validation(String),
-    
+
     #[error("Internal server error: {0}")]
     Internal(String),
 }
@@ -53,12 +53,12 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
-        
+
         // For rate limit errors, delegate to BarnacleError's response
         if let AppError::RateLimit(barnacle_error) = self {
             return barnacle_error.into_response();
         }
-        
+
         let body = Json(json!({
             "error": {
                 "code": self.error_code(),
@@ -85,7 +85,7 @@ impl FromBarnacleError<AppError> for AppError {
 async fn protected_handler() -> Result<Json<serde_json::Value>, AppError> {
     // Simulate some operation that might fail with a BarnacleError
     let result = simulate_barnacle_operation().await;
-    
+
     match result {
         Ok(data) => Ok(Json(json!({
             "message": "Success",
@@ -101,7 +101,7 @@ async fn protected_handler() -> Result<Json<serde_json::Value>, AppError> {
 /// Example handler that demonstrates manual error conversion
 async fn manual_conversion_handler() -> Result<Json<serde_json::Value>, AppError> {
     let result = simulate_barnacle_operation().await;
-    
+
     match result {
         Ok(data) => Ok(Json(json!({
             "message": "Success",
@@ -110,18 +110,23 @@ async fn manual_conversion_handler() -> Result<Json<serde_json::Value>, AppError
         Err(barnacle_error) => {
             // Manual conversion with additional context
             match barnacle_error {
-                BarnacleError::RateLimitExceeded { remaining, retry_after, limit } => {
+                BarnacleError::RateLimitExceeded {
+                    remaining,
+                    retry_after,
+                    limit,
+                } => {
                     // You could transform this into your own error type
-                    Err(AppError::RateLimit(BarnacleError::rate_limit_exceeded(
-                        remaining, retry_after, limit
-                    ).with_context("User exceeded API rate limit")))
-                },
-                BarnacleError::ApiKeyMissing => {
-                    Err(AppError::Authentication("API key is required for this endpoint".to_string()))
-                },
-                BarnacleError::InvalidApiKey { key_hint } => {
-                    Err(AppError::Authentication(format!("Invalid API key: {}", key_hint)))
-                },
+                    Err(AppError::RateLimit(
+                        BarnacleError::rate_limit_exceeded(remaining, retry_after, limit)
+                            .with_context("User exceeded API rate limit"),
+                    ))
+                }
+                BarnacleError::ApiKeyMissing => Err(AppError::Authentication(
+                    "API key is required for this endpoint".to_string(),
+                )),
+                BarnacleError::InvalidApiKey { key_hint } => Err(AppError::Authentication(
+                    format!("Invalid API key: {}", key_hint),
+                )),
                 other => {
                     // For other errors, wrap as internal error
                     Err(AppError::Internal(format!("Service error: {}", other)))
@@ -133,9 +138,10 @@ async fn manual_conversion_handler() -> Result<Json<serde_json::Value>, AppError
 
 /// Example handler showing how to add context to BarnacleErrors
 async fn context_handler() -> Result<Json<serde_json::Value>, AppError> {
-    let result = simulate_barnacle_operation().await
+    let result = simulate_barnacle_operation()
+        .await
         .map_err(|err| err.with_context("Failed during user data processing"))?;
-    
+
     Ok(Json(json!({
         "message": "Success",
         "data": result
@@ -146,13 +152,16 @@ async fn context_handler() -> Result<Json<serde_json::Value>, AppError> {
 async fn simulate_barnacle_operation() -> Result<HashMap<String, String>, BarnacleError> {
     // Simulate different types of errors
     let error_type = std::env::var("SIMULATE_ERROR").unwrap_or_default();
-    
+
     match error_type.as_str() {
         "rate_limit" => Err(BarnacleError::rate_limit_exceeded(0, 60, 100)),
         "api_key_missing" => Err(BarnacleError::ApiKeyMissing),
         "invalid_key" => Err(BarnacleError::invalid_api_key("test_key_123")),
         "store_error" => Err(BarnacleError::store_error("Redis connection failed")),
-        "custom" => Err(BarnacleError::custom("Custom application error", Some(StatusCode::CONFLICT))),
+        "custom" => Err(BarnacleError::custom(
+            "Custom application error",
+            Some(StatusCode::CONFLICT),
+        )),
         _ => {
             let mut data = HashMap::new();
             data.insert("key".to_string(), "value".to_string());
@@ -162,12 +171,12 @@ async fn simulate_barnacle_operation() -> Result<HashMap<String, String>, Barnac
 }
 
 /// Example middleware that converts BarnacleError to AppError
-async fn error_conversion_middleware<B>(
-    req: axum::extract::Request<B>,
-    next: axum::middleware::Next<B>,
+async fn error_conversion_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
 ) -> Result<Response, AppError> {
     let response = next.run(req).await;
-    
+
     // If the response is an error that contains BarnacleError information,
     // you could inspect and transform it here
     Ok(response)
@@ -176,7 +185,7 @@ async fn error_conversion_middleware<B>(
 #[tokio::main]
 async fn main() {
     // Initialize tracing
-    tracing_subscriber::init();
+    tracing_subscriber::fmt::init();
 
     // Build the application with error handling
     let app = Router::new()
@@ -195,7 +204,9 @@ async fn main() {
     println!("  rate_limit, api_key_missing, invalid_key, store_error, custom");
 
     // Start the server
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+        .await
+        .unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -242,7 +253,7 @@ mod tests {
     #[test]
     fn test_barnacle_error_properties() {
         let error = BarnacleError::rate_limit_exceeded(5, 30, 100);
-        
+
         assert_eq!(error.status_code(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(error.error_code(), "RATE_LIMIT_EXCEEDED");
         assert_eq!(error.error_type(), "rate_limit");
@@ -252,9 +263,9 @@ mod tests {
 
     #[test]
     fn test_error_context() {
-        let error = BarnacleError::store_error("Connection failed")
-            .with_context("Database operation");
-        
+        let error =
+            BarnacleError::store_error("Connection failed").with_context("Database operation");
+
         assert!(error.to_string().contains("Database operation"));
         assert!(error.to_string().contains("Connection failed"));
     }

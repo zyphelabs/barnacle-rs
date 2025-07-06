@@ -86,8 +86,11 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait BarnacleStore: Send + Sync {
     /// Increments the counter for the key and returns the current number of requests and remaining time until reset.
-    async fn increment(&self, context: &BarnacleContext, config: &BarnacleConfig)
-        -> types::BarnacleResult;
+    async fn increment(
+        &self,
+        context: &BarnacleContext,
+        config: &BarnacleConfig,
+    ) -> types::BarnacleResult;
     /// Resets the counter for the key (e.g., after successful login).
     async fn reset(&self, context: &BarnacleContext) -> Result<(), BarnacleError>;
 }

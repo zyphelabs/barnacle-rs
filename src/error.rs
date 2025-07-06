@@ -284,8 +284,7 @@ impl BarnacleError {
             BarnacleError::ApiKeyValidation { .. }
             | BarnacleError::ApiKeyMissing
             | BarnacleError::InvalidApiKey { .. } => "authentication",
-            BarnacleError::StoreError { .. }
-            | BarnacleError::ConnectionPool { .. } => "backend",
+            BarnacleError::StoreError { .. } | BarnacleError::ConnectionPool { .. } => "backend",
             #[cfg(feature = "redis")]
             BarnacleError::Redis { .. } => "backend",
             BarnacleError::Configuration { .. } | BarnacleError::Internal { .. } => "server",
@@ -312,10 +311,16 @@ impl IntoResponse for BarnacleError {
         } = &self
         {
             let headers = response.headers_mut();
-            headers.insert("X-RateLimit-Remaining", remaining.to_string().parse().unwrap());
+            headers.insert(
+                "X-RateLimit-Remaining",
+                remaining.to_string().parse().unwrap(),
+            );
             headers.insert("X-RateLimit-Limit", limit.to_string().parse().unwrap());
             headers.insert("Retry-After", retry_after.to_string().parse().unwrap());
-            headers.insert("X-RateLimit-Reset", retry_after.to_string().parse().unwrap());
+            headers.insert(
+                "X-RateLimit-Reset",
+                retry_after.to_string().parse().unwrap(),
+            );
         }
 
         // Add retry-after header for retryable errors
