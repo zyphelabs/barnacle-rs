@@ -17,6 +17,7 @@ Rate limiting and API key validation middleware for Axum with Redis backend.
 
 - **Rate Limiting**: IP-based or custom key-based rate limiting
 - **API Key Validation**: Validate `x-api-key` header with per-key limits
+- **Request Modification**: Modify request parts after validation but before processing
 - **Redis Backend**: Distributed rate limiting with Redis
 - **Axum Middleware**: Drop-in middleware for Axum applications
 - **Reset on Success**: Optional rate limit reset on successful operations
@@ -256,6 +257,69 @@ let middleware: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _> = Ba
 - The validator closure must take owned arguments: `(String, ApiKeyConfig, Arc<Parts>, State)`.
 - If you do not provide a validator, use `()` for the last type parameter.
 - If you provide a validator, use `_` for the last type parameter to let Rust infer the closure type.
+- If you provide a request modifier, use `_` for the last two type parameters to let Rust infer the types.
+
+### Request Modification
+
+Modify request parts after validation but before the request reaches your handler:
+
+```rust
+use barnacle_rs::{BarnacleLayer, BarnacleConfig, RedisBarnacleStore, BarnacleError, ApiKeyConfig};
+use axum::{Router, routing::get};
+use axum::http::request::Parts;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = RedisBarnacleStore::from_url("redis://127.0.0.1:6379").await?;
+    let config = BarnacleConfig::default();
+
+    // Optional API key validator
+    let api_key_validator = |api_key: String, _config: ApiKeyConfig, _parts: Arc<Parts>, _state: ()| async move {
+        if api_key == "valid-key" {
+            Ok(())
+        } else {
+            Err(BarnacleError::invalid_api_key(api_key))
+        }
+    };
+
+    // Request modifier that adds a custom header after validation
+    let request_modifier = |mut parts: Parts, _state: ()| async move {
+        parts.headers.insert(
+            "x-request-modified",
+            "true".parse().unwrap()
+        );
+        Ok(parts)
+    };
+
+    let layer: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _, _> = BarnacleLayer::builder()
+        .with_store(store)
+        .with_config(config)
+        .with_api_key_validator(api_key_validator) // Optional: only if you want validation
+        .with_request_modifier(request_modifier)
+        .build()
+        .unwrap();
+
+    let app = Router::new()
+        .route("/api/modified", get(handler))
+        .layer(layer);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn handler() -> &'static str {
+    "Request was modified by Barnacle!"
+}
+```
+
+**Note:**
+- The modifier closure receives `(Parts, State)` and returns `Result<Parts, Error>`.
+- Modifications happen after successful validation but before request reconstruction.
+- Use `_` for the modifier type parameter to let Rust infer the closure type.
+- The modifier has access to all request parts (headers, extensions, URI, method, etc.).
+- If you don't provide a modifier, use `()` for the last type parameter.
 
 ### Running Examples
 
@@ -268,9 +332,9 @@ cargo run --example error_integration
 cargo run --example api_key_test
 ```
 
-### Error Integration & Custom Validator
+### Error Integration, Custom Validator & Request Modification
 
-For error handling and custom validator implementation, see:
+For error handling, custom validator implementation, and request modification, see:
 
 - `examples/error_integration.rs`
 - `examples/custom_validator_example.rs`
