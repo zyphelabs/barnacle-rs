@@ -36,20 +36,22 @@ pub enum BarnacleLayerBuilderError {
 }
 
 /// Builder for BarnacleLayer
-pub struct BarnacleLayerBuilder<T = (), S = RedisBarnacleStore, State = (), E = BarnacleError, V = ()> {
+pub struct BarnacleLayerBuilder<T = (), S = RedisBarnacleStore, State = (), E = BarnacleError, V = (), M = ()> {
     store: Option<S>,
     config: Option<BarnacleConfig>,
     state: Option<State>,
     api_key_validator: Option<V>,
     api_key_middleware_config: Option<ApiKeyConfig>,
+    request_modifier: Option<M>,
     _phantom: PhantomData<(T, E)>,
 }
 
-impl<T, S, State, E, V> BarnacleLayerBuilder<T, S, State, E, V>
+impl<T, S, State, E, V, M> BarnacleLayerBuilder<T, S, State, E, V, M>
 where
     S: BarnacleStore + 'static,
     State: Clone +Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
+    M: Clone + Send + Sync + 'static,
 {
     pub fn with_store(mut self, store: S) -> Self {
         self.store = Some(store);
@@ -71,33 +73,40 @@ where
         self.api_key_middleware_config = Some(config);
         self
     }
-    pub fn build(self) -> Result<BarnacleLayer<T, S, State, E, V>, BarnacleLayerBuilderError> {
+    pub fn with_request_modifier(mut self, modifier: M) -> Self {
+        self.request_modifier = Some(modifier);
+        self
+    }
+    pub fn build(self) -> Result<BarnacleLayer<T, S, State, E, V, M>, BarnacleLayerBuilderError> {
         Ok(BarnacleLayer {
             store: self.store.ok_or(BarnacleLayerBuilderError::MissingStore)?,
             config: self.config.ok_or(BarnacleLayerBuilderError::MissingConfig)?,
             state: self.state,
             api_key_validator: self.api_key_validator,
             api_key_middleware_config: self.api_key_middleware_config,
+            request_modifier: self.request_modifier,
             _phantom: PhantomData,
         })
     }
 }
 
 /// Generic rate limiting and API key layer
-pub struct BarnacleLayer<T = (), S = RedisBarnacleStore, State = (), E = BarnacleError, V = ()> {
+pub struct BarnacleLayer<T = (), S = RedisBarnacleStore, State = (), E = BarnacleError, V = (), M = ()> {
     store: S,
     config: BarnacleConfig,
     state: Option<State>,
     api_key_validator: Option<V>,
     api_key_middleware_config: Option<ApiKeyConfig>,
+    request_modifier: Option<M>,
     _phantom: PhantomData<(T, E)>,
 }
 
-impl<T, S, State, E, V> Clone for BarnacleLayer<T, S, State, E, V>
+impl<T, S, State, E, V, M> Clone for BarnacleLayer<T, S, State, E, V, M>
 where
     S: Clone + BarnacleStore + 'static,
     State: Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
+    M: Clone + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -106,30 +115,33 @@ where
             state: self.state.clone(),
             api_key_validator: self.api_key_validator.clone(),
             api_key_middleware_config: self.api_key_middleware_config.clone(),
+            request_modifier: self.request_modifier.clone(),
             _phantom: PhantomData,
         }
     }
 }
 
-impl<T, S, State, E, V> BarnacleLayer<T, S, State, E, V>
+impl<T, S, State, E, V, M> BarnacleLayer<T, S, State, E, V, M>
 where
     S: BarnacleStore + 'static,
     State: Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
+    M: Clone + Send + Sync + 'static,
 {
-    pub fn builder() -> BarnacleLayerBuilder<T, S, State, E, V> {
+    pub fn builder() -> BarnacleLayerBuilder<T, S, State, E, V, M> {
         BarnacleLayerBuilder {
             store: None,
             config: None,
             state: None,
             api_key_validator: None,
             api_key_middleware_config: None,
+            request_modifier: None,
             _phantom: PhantomData,
         }
     }
 }
 
-impl<Inner, T, S, State, E, V> Layer<Inner> for BarnacleLayer<T, S, State, E, V>
+impl<Inner, T, S, State, E, V, M> Layer<Inner> for BarnacleLayer<T, S, State, E, V, M>
 where
     T: DeserializeOwned + KeyExtractable + Send + 'static,
     S: Clone + BarnacleStore + 'static,
@@ -137,8 +149,9 @@ where
     E: IntoResponse + Send + Sync + 'static,
     Inner: Clone,
     V: Clone + Send + Sync + 'static,
+    M: Clone + Send + Sync + 'static,
 {
-    type Service = BarnacleMiddleware<Inner, T, S, State, E, V>;
+    type Service = BarnacleMiddleware<Inner, T, S, State, E, V, M>;
     fn layer(&self, inner: Inner) -> Self::Service {
         BarnacleMiddleware {
             inner,
@@ -147,6 +160,7 @@ where
             state: self.state.clone(),
             api_key_validator: self.api_key_validator.clone(),
             api_key_config: self.api_key_middleware_config.clone(),
+            request_modifier: self.request_modifier.clone(),
             _phantom: PhantomData,
         }
     }
@@ -247,22 +261,24 @@ fn get_fallback_key_common(
 
 
 /// The actual middleware that handles payload-based key extraction
-pub struct BarnacleMiddleware<Inner, T, S, State = (), E = BarnacleError, V = ()> {
+pub struct BarnacleMiddleware<Inner, T, S, State = (), E = BarnacleError, V = (), M = ()> {
     inner: Inner,
     store: S,
     config: BarnacleConfig,
     state: Option<State>,
     api_key_validator: Option<V>,
     api_key_config: Option<ApiKeyConfig>,
+    request_modifier: Option<M>,
     _phantom: PhantomData<(T, E)>,
 }
 
-impl<Inner, T, S, State, E, V> Clone for BarnacleMiddleware<Inner, T, S, State, E, V>
+impl<Inner, T, S, State, E, V, M> Clone for BarnacleMiddleware<Inner, T, S, State, E, V, M>
 where
     Inner: Clone,
     S: Clone + BarnacleStore + 'static,
     State: Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
+    M: Clone + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -272,6 +288,7 @@ where
             state: self.state.clone(),
             api_key_validator: self.api_key_validator.clone(),
             api_key_config: self.api_key_config.clone(),
+            request_modifier: self.request_modifier.clone(),
             _phantom: PhantomData,
         }
     }
@@ -322,6 +339,47 @@ impl<T, S, State, E> ValidatorCall<T, S, State, E> for () {
     }
 }
 
+// --- RequestModifier trait for owned types ---
+pub trait RequestModifier<Parts, State, E> {
+    fn modify(
+        &self,
+        parts: Parts,
+        state: State,
+    ) -> Pin<Box<dyn Future<Output = Result<Parts, E>> + Send>>;
+}
+
+// Blanket impl to require Send for Parts
+impl<Parts, State, E> RequestModifier<Parts, State, E> for ()
+where
+    Parts: Send + 'static,
+{
+    fn modify(
+        &self,
+        parts: Parts,
+        _state: State,
+    ) -> Pin<Box<dyn Future<Output = Result<Parts, E>> + Send>> {
+        Box::pin(async { Ok(parts) })
+    }
+}
+
+// Implementation for closures
+impl<F, Fut, Parts, State, E> RequestModifier<Parts, State, E> for F
+where
+    F: Fn(Parts, State) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<Parts, E>> + Send + 'static,
+    Parts: Send + 'static,
+    State: Send + 'static,
+    E: Send + 'static,
+{
+    fn modify(
+        &self,
+        parts: Parts,
+        state: State,
+    ) -> Pin<Box<dyn Future<Output = Result<Parts, E>> + Send>> {
+        Box::pin((self)(parts, state))
+    }
+}
+
 // Provide a KeyExtractable impl for ()
 impl KeyExtractable for () {
     fn extract_key(&self, request_parts: &Parts) -> BarnacleKey {
@@ -334,7 +392,7 @@ impl KeyExtractable for () {
     }
 }
 
-impl<Inner, B, T, S, State, E, V> Service<Request<B>> for BarnacleMiddleware<Inner, T, S, State, E, V>
+impl<Inner, B, T, S, State, E, V, M> Service<Request<B>> for BarnacleMiddleware<Inner, T, S, State, E, V, M>
 where
     Inner: Service<Request<axum::body::Body>, Response = Response<Body>> + Clone + Send + 'static,
     Inner::Future: Send + 'static,
@@ -346,6 +404,7 @@ where
     T: KeyExtractable + DeserializeOwned + Send + 'static,
     E: IntoResponse + Send + Sync + 'static + From<BarnacleError>,
     V: ValidatorCall<String, ApiKeyConfig, State, E> + Clone + Send + Sync + 'static,
+    M: RequestModifier<Parts, State, E> + Clone + Send + Sync + 'static,
 {
     type Response = Inner::Response;
     type Error = Inner::Error;
@@ -363,8 +422,10 @@ where
         let store = self.store.clone();
         let config = self.config.clone();
         let state = self.state.clone();
+        let validator_state = state.clone(); // Separate clone for validator to avoid move issues
         let api_key_validator = self.api_key_validator.clone();
         let api_key_config = self.api_key_config.clone();
+        let request_modifier = self.request_modifier.clone();
         Box::pin(async move {
             debug!("[middleware.rs] Entered async block in call");
             let current_path = req
@@ -390,9 +451,9 @@ where
                     // Both validator and state are (), safe to call with zeroed State
                     validator.call(api_key.to_string(), api_key_config, Arc::new(parts.clone()), unsafe { std::mem::zeroed() }).await
                 } else {
-                    match state {
-                        Some(state) => {
-                            validator.call(api_key.to_string(), api_key_config, Arc::new(parts.clone()), state).await
+                    match validator_state {
+                        Some(validator_state) => {
+                            validator.call(api_key.to_string(), api_key_config, Arc::new(parts.clone()), validator_state).await
                         }
                         None => {
                             // Return a more appropriate error for missing validator state
@@ -415,6 +476,29 @@ where
                     return Ok(e.into_response());
                 }
             }
+
+            // Apply request modifier after validation (if configured)
+            let modified_parts = if let Some(modifier) = request_modifier.as_ref() {
+                // Clone state for modifier to avoid move issues
+                let modifier_state = state.clone();
+                if let Some(modifier_state) = modifier_state {
+                    modifier.modify(parts, modifier_state).await
+                } else {
+                    Err(E::from(BarnacleError::custom("Barnacle: Request modifier requires state, but none was provided.", None)))
+                }
+            } else {
+                Ok(parts)
+            };
+            let parts = match modified_parts {
+                Ok(modified_parts) => {
+                    debug!("[middleware.rs] Request modifier returned Ok");
+                    modified_parts
+                },
+                Err(e) => {
+                    debug!("[middleware.rs] Request modifier returned Err");
+                    return Ok(e.into_response());
+                }
+            };
 
             // Unified logic: always try to extract key from body (for T=(), uses fallback)
             let (rate_limit_context, body_bytes) = match body.collect().await {
