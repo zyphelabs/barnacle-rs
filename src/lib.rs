@@ -55,7 +55,7 @@ mod types;
 pub use api_key_store::{ApiKeyStore, StaticApiKeyStore};
 pub use error::BarnacleError;
 pub use middleware::{
-    BarnacleLayer, KeyExtractable, BarnacleLayerBuilderError
+    BarnacleLayer, KeyExtractable, BarnacleLayerBuilderError, RequestModifier
 };
 pub use tracing;
 pub use types::{

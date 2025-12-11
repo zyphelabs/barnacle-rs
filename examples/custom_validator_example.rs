@@ -77,11 +77,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(BarnacleError::invalid_api_key(api_key))
         }
     };
-    let auth_layer: BarnacleLayer<(), _, _, _, _> = BarnacleLayer::builder()
+    // Example request modifier that adds a custom header after validation
+    let request_modifier = |mut parts: Parts, _state: Arc<PostgresApiKeyStore>| async move {
+        // Add a custom header to show the request was modified
+        parts.headers.insert(
+            "x-modified-by",
+            "barnacle-request-modifier".parse().unwrap()
+        );
+        Ok(parts)
+    };
+
+    let auth_layer: BarnacleLayer<(), _, _, _, _, _> = BarnacleLayer::builder()
         .with_store(store)
         .with_config(config)
         .with_state(state.clone())
         .with_api_key_validator(api_key_validator)
+        .with_request_modifier(request_modifier)
         .build()
         .unwrap();
 
