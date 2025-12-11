@@ -1,6 +1,6 @@
 [package]
 name = "barnacle-rs"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Advanced rate limiting middleware for Axum with Redis backend, API key validation, and custom key extraction"
 readme = "README.md"
@@ -10,7 +10,7 @@ homepage = "https://github.com/zyphelabs/barnacle-rs"
 keywords = ["rate-limiting", "axum", "middleware", "api-key", "key-extractor"]
 categories = ["web-programming::http-server", "asynchronous", "caching"]
 authors = ["Zyphe Inc"]
-rust-version = "1.70"
+rust-version = "1.90"
 
 [features]
 default = ["redis"]
@@ -19,8 +19,8 @@ redis = ["dep:redis", "dep:deadpool-redis"]
 [dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread"] }
-redis = { version = "0.32.2", features = ["tokio-comp"], optional = true }
-deadpool-redis = { version = "0.21.1", features = [
+redis = { version = "0.32", features = ["tokio-comp"], optional = true }
+deadpool-redis = { version = "0.22", features = [
     "rt_tokio_1",
 ], optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -29,14 +29,12 @@ async-trait = "0.1"
 thiserror = "2"
 anyhow = "1.0"
 tower = { version = "0.5", features = ["util"] }
-tower-layer = "0.3"
-tower-service = "0.3"
 http-body-util = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.17.0", features = ["v4"] }
-futures = "0.3.31"
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
