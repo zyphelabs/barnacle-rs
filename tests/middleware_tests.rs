@@ -319,6 +319,19 @@ mod client_ip_strategy {
     }
 
     #[tokio::test]
+    async fn trusted_proxies_never_use_unparsable_hops_as_keys() {
+        let store = MemoryStore::default();
+        let app = app(store.clone(), trusted());
+        // A trusted proxy relaying a client value as is: stop at it, keep the last proxy
+        let req = request("GET", "/")
+            .header("x-forwarded-for", "203.0.113.7, random-token-1, 10.1.2.3")
+            .body(Body::empty())
+            .unwrap();
+        send(&app, with_peer(req, "10.0.0.5:4000")).await;
+        assert_eq!(counted_ips(&store), ["10.1.2.3"]);
+    }
+
+    #[tokio::test]
     async fn client_ip_uses_the_layer_strategy_in_handlers_and_extractors() {
         let app = app(MemoryStore::default(), trusted());
         let req = request("GET", "/ip")

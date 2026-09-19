@@ -87,6 +87,31 @@ async fn counters_without_expiry_are_repaired() {
 }
 
 #[tokio::test]
+async fn peek_repairs_counters_without_expiry() {
+    let store = store();
+    let context = unique_context();
+    let config = limit(2, 30);
+    let mut conn = connection().await;
+
+    // Over the limit with no TTL: peek rejects before increment could repair it
+    let _: () = deadpool_redis::redis::cmd("SET")
+        .arg(redis_key(&context))
+        .arg(5)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    let error = store.peek(&context, &config).await.unwrap_err();
+    assert!(matches!(error, BarnacleError::RateLimitExceeded { retry_after: 30, .. }));
+    let ttl: i64 = deadpool_redis::redis::cmd("TTL")
+        .arg(redis_key(&context))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(ttl > 0 && ttl <= 30, "ttl = {ttl}");
+}
+
+#[tokio::test]
 async fn increments_report_remaining_and_reset() {
     let store = store();
     let context = unique_context();

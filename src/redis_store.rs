@@ -47,10 +47,27 @@ end
 return {1, count, ttl}
 "#;
 
+/// Reads a counter without incrementing it, restoring a missing expiry like
+/// [`INCREMENT_SCRIPT`] so a counter over the limit can't be stuck by `peek` alone.
+///
+/// KEYS[1] = counter key, ARGV[1] = window in seconds. Returns `{count, ttl}`.
+#[cfg(feature = "redis")]
+const PEEK_SCRIPT: &str = r#"
+local window = tonumber(ARGV[1])
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local ttl = redis.call('TTL', KEYS[1])
+if ttl == -1 then
+  redis.call('EXPIRE', KEYS[1], window)
+  ttl = window
+end
+return {current, ttl}
+"#;
+
 #[cfg(feature = "redis")]
 struct RedisBarnacleStoreInner {
     pool: Pool,
     increment_script: Script,
+    peek_script: Script,
 }
 
 #[cfg(feature = "redis")]
@@ -59,6 +76,7 @@ impl RedisBarnacleStoreInner {
         Self {
             pool,
             increment_script: Script::new(INCREMENT_SCRIPT),
+            peek_script: Script::new(PEEK_SCRIPT),
         }
     }
 
@@ -90,12 +108,12 @@ fn window_seconds(config: &BarnacleConfig) -> u64 {
     config.window.as_secs().max(1)
 }
 
-/// Seconds until the window resets, falling back to the full window when Redis
-/// reports no expiry.
+/// Seconds until the window resets (at least 1, as Redis reports 0 in the last second),
+/// falling back to the full window when Redis reports no expiry.
 #[cfg(feature = "redis")]
 fn reset_after(ttl: i64, config: &BarnacleConfig) -> Duration {
-    if ttl > 0 {
-        Duration::from_secs(ttl as u64)
+    if ttl >= 0 {
+        Duration::from_secs(ttl.max(1) as u64)
     } else {
         Duration::from_secs(window_seconds(config))
     }
@@ -162,20 +180,18 @@ impl RedisBarnacleStore {
         }
     }
 
-    /// Create a new Redis store from a Redis URL
+    /// Create a new Redis store from a Redis URL, with the default [`RedisPoolOptions`]
     pub fn from_url(url: &str) -> Result<Self, deadpool_redis::PoolError> {
-        Ok(Self::new(create_pool(url, None)?))
+        Self::from_url_with_options(url, RedisPoolOptions::default())
     }
 
-    /// Create a new Redis store with custom pool configuration
+    /// Create a new Redis store with the given pool size and the default timeouts
     pub fn with_pool_config(url: &str, max_size: usize) -> Result<Self, deadpool_redis::PoolError> {
         Self::from_url_with_options(
             url,
             RedisPoolOptions {
                 max_size: Some(max_size),
-                wait_timeout: None,
-                create_timeout: None,
-                recycle_timeout: None,
+                ..Default::default()
             },
         )
     }
@@ -268,16 +284,17 @@ impl BarnacleStore for RedisBarnacleStore {
         let redis_key = self.inner.get_redis_key(context);
         let mut conn = self.inner.get_connection().await?;
 
-        let (count, ttl): (Option<u32>, i64) = deadpool_redis::redis::pipe()
-            .get(&redis_key)
-            .ttl(&redis_key)
-            .query_async(&mut conn)
+        let (count, ttl): (u32, i64) = self
+            .inner
+            .peek_script
+            .key(&redis_key)
+            .arg(window_seconds(config))
+            .invoke_async(&mut conn)
             .await
             .map_err(|e| {
-                BarnacleError::store_error_with_source("Redis peek operation failed", Box::new(e))
+                BarnacleError::store_error_with_source("Redis peek script failed", Box::new(e))
             })?;
 
-        let count = count.unwrap_or(0);
         let reset_after = reset_after(ttl, config);
         if count >= config.max_requests {
             return Err(BarnacleError::rate_limit_exceeded(

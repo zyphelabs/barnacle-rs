@@ -388,8 +388,9 @@ fn resolve_client_ip(
                         }
                         leftmost_trusted = Some(ip.to_string());
                     }
-                    // Written by a trusted proxy, so it can't be forged by the client
-                    Err(_) => return Some(hop.to_string()),
+                    // Not an address (e.g. a client value relayed as is): nothing left
+                    // of it can be trusted, and it must not become a bucket key
+                    Err(_) => break,
                 }
             }
             leftmost_trusted.or_else(|| peer.map(|ip| ip.to_string()))

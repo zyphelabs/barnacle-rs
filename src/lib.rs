@@ -98,19 +98,18 @@ pub trait BarnacleStore: Clone + Send + Sync {
     ///
     /// Returns `Err(BarnacleError::RateLimitExceeded)` when the limit is already reached.
     /// Used to reject clients that exceeded the failed API key validation limit before
-    /// running the validator again. The default implementation never rejects: stores
-    /// that don't override it only start rejecting once `increment` does.
+    /// running the validator again. The default implementation returns a store error,
+    /// so a store without `peek` is handled by the layer's [`StoreFailurePolicy`]
+    /// (rejected with the default `FailClosed`) instead of silently skipping the limit.
     async fn peek(
         &self,
         context: &BarnacleContext,
         config: &BarnacleConfig,
     ) -> Result<types::BarnacleResult, BarnacleError> {
-        let _ = context;
-        Ok(types::BarnacleResult {
-            allowed: true,
-            remaining: config.max_requests,
-            retry_after: None,
-        })
+        let _ = (context, config);
+        Err(BarnacleError::store_error(
+            "This store does not implement `peek`, required by the failed validation limit",
+        ))
     }
 }
 

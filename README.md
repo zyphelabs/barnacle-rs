@@ -462,7 +462,10 @@ redis-cli SET "barnacle:api_keys:config:$HASH" '{"max_requests":100,"window":{"s
 - The body is only buffered when the key is read from the payload. A body that can't be
   read now answers 400 instead of being replaced by an empty body.
 - `BarnacleError` has a new `PayloadTooLarge` variant (413), and `BarnacleStore` has a new
-  `peek` method with a default implementation.
+  `peek` method. Its default implementation returns a store error, so custom stores must
+  implement it to use `with_failed_validation_limit`.
+- `RedisBarnacleStore::from_url` and `with_pool_config` now use the default pool timeouts
+  (500ms); use `from_url_with_options` to change or disable them.
 - Rate limited responses carry `Retry-After`; successful responses carry `X-RateLimit-Reset`.
 - The service accepts `Request<B>` with `B: HttpBody<Data = Bytes>` (e.g. `axum::body::Body`).
 
