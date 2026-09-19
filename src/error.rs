@@ -1,5 +1,5 @@
 use axum::{
-    http::StatusCode,
+    http::{header::RETRY_AFTER, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -69,6 +69,10 @@ pub enum BarnacleError {
     /// Request parsing errors
     #[error("Request parsing error: {message}")]
     RequestParsing { message: String },
+
+    /// Request body larger than the configured limit
+    #[error("Request body exceeds the limit of {limit} bytes")]
+    PayloadTooLarge { limit: usize },
 
     /// Internal server errors
     #[error("Internal server error: {message}")]
@@ -200,6 +204,7 @@ impl BarnacleError {
             BarnacleError::Configuration { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             BarnacleError::JsonError { .. } => StatusCode::BAD_REQUEST,
             BarnacleError::RequestParsing { .. } => StatusCode::BAD_REQUEST,
+            BarnacleError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             BarnacleError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             BarnacleError::Custom { status_code, .. } => {
                 status_code.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
@@ -225,6 +230,29 @@ impl BarnacleError {
         }
     }
 
+    /// Rate limit headers (`Retry-After`, `X-RateLimit-*`) for a
+    /// [`BarnacleError::RateLimitExceeded`], `None` for any other error.
+    ///
+    /// The middleware adds these to the response even when the error is converted
+    /// into a custom error type, so they are not lost in the conversion.
+    pub fn rate_limit_headers(&self) -> Option<HeaderMap> {
+        let BarnacleError::RateLimitExceeded {
+            remaining,
+            retry_after,
+            limit,
+        } = self
+        else {
+            return None;
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, to_header_value(retry_after));
+        headers.insert("X-RateLimit-Remaining", to_header_value(remaining));
+        headers.insert("X-RateLimit-Limit", to_header_value(limit));
+        // X-RateLimit-Reset follows Barnacle's convention: seconds until reset (same as Retry-After)
+        headers.insert("X-RateLimit-Reset", to_header_value(retry_after));
+        Some(headers)
+    }
+
     /// Convert this error into a JSON representation
     pub fn to_json_value(&self) -> serde_json::Value {
         let mut json = json!({
@@ -247,6 +275,9 @@ impl BarnacleError {
                     "retry_after": retry_after,
                     "limit": limit
                 });
+            }
+            BarnacleError::PayloadTooLarge { limit } => {
+                json["error"]["details"] = json!({ "limit": limit });
             }
             BarnacleError::Custom { .. } => {
                 // Allow custom errors to provide additional context
@@ -272,6 +303,7 @@ impl BarnacleError {
             BarnacleError::Configuration { .. } => "CONFIGURATION_ERROR",
             BarnacleError::JsonError { .. } => "JSON_ERROR",
             BarnacleError::RequestParsing { .. } => "REQUEST_PARSING_ERROR",
+            BarnacleError::PayloadTooLarge { .. } => "PAYLOAD_TOO_LARGE",
             BarnacleError::Internal { .. } => "INTERNAL_ERROR",
             BarnacleError::Custom { .. } => "CUSTOM_ERROR",
         }
@@ -288,7 +320,9 @@ impl BarnacleError {
             #[cfg(feature = "redis")]
             BarnacleError::Redis { .. } => "backend",
             BarnacleError::Configuration { .. } | BarnacleError::Internal { .. } => "server",
-            BarnacleError::JsonError { .. } | BarnacleError::RequestParsing { .. } => "client",
+            BarnacleError::JsonError { .. }
+            | BarnacleError::RequestParsing { .. }
+            | BarnacleError::PayloadTooLarge { .. } => "client",
             BarnacleError::Custom { .. } => "custom",
         }
     }
@@ -312,17 +346,8 @@ impl IntoResponse for BarnacleError {
         *response.status_mut() = status;
 
         // Add rate limit headers for rate limit errors
-        if let BarnacleError::RateLimitExceeded {
-            remaining,
-            retry_after,
-            limit,
-        } = &self
-        {
-            let headers = response.headers_mut();
-            headers.insert("X-RateLimit-Remaining", to_header_value(remaining));
-            headers.insert("X-RateLimit-Limit", to_header_value(limit));
-            // X-RateLimit-Reset follows Barnacle's convention: seconds until reset (same as Retry-After)
-            headers.insert("X-RateLimit-Reset", to_header_value(retry_after));
+        if let Some(rate_limit_headers) = self.rate_limit_headers() {
+            response.headers_mut().extend(rate_limit_headers);
         }
 
         response

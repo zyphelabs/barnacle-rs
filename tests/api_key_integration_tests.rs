@@ -273,8 +273,8 @@ mod api_keys {
     #[tokio::test]
     async fn test_redis_connection_failure() {
         init_tracing();
-        // Invalid redis url
-        let redis_cfg = RedisConfig::from_url("redis://invalid-host:6379/");
+        // Unreachable redis (a hostname could still resolve, e.g. with ISP DNS wildcards)
+        let redis_cfg = RedisConfig::from_url("redis://127.0.0.1:1/");
         let pool = redis_cfg
             .create_pool(None)
             .expect("Failed to create Redis pool");

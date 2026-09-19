@@ -6,6 +6,8 @@ use deadpool_redis::{Connection, Pool};
 
 use crate::error::BarnacleError;
 use crate::types::{ApiKeyValidationResult, BarnacleConfig, StaticApiKeyConfig};
+#[cfg(feature = "redis")]
+use crate::types::{hash_api_key, redact_api_key};
 
 /// Trait for API key validation and configuration retrieval
 #[async_trait]
@@ -81,12 +83,13 @@ impl RedisApiKeyStore {
         self.pool.get().await
     }
 
+    // API keys are hashed so they are never stored in clear text
     fn get_redis_key(&self, api_key: &str) -> String {
-        format!("{}:{}", self.key_prefix, api_key)
+        format!("{}:{}", self.key_prefix, hash_api_key(api_key))
     }
 
     fn get_config_key(&self, api_key: &str) -> String {
-        format!("{}:config:{}", self.key_prefix, api_key)
+        format!("{}:config:{}", self.key_prefix, hash_api_key(api_key))
     }
 
     pub async fn save_key(
@@ -100,7 +103,7 @@ impl RedisApiKeyStore {
         let default_ttl: u64 = 24 * 60 * 60; // 24 hours
         let ttl_api_key_secs: u64 = ttl_seconds.unwrap_or(default_ttl);
 
-        tracing::debug!("Saving API key: {}", api_key);
+        tracing::debug!("Saving API key: {}", redact_api_key(api_key));
 
         let mut conn = self.get_connection().await.map_err(|e| {
             BarnacleError::connection_pool_error("Failed to get Redis connection", Box::new(e))
@@ -150,19 +153,19 @@ impl RedisApiKeyStore {
         let validation_result = self.validate_key(api_key).await;
 
         if validation_result.valid {
-            tracing::debug!("API key found in Redis cache: {}", api_key);
+            tracing::debug!("API key found in Redis cache: {}", redact_api_key(api_key));
             return Ok(validation_result);
         }
 
         // If not in Redis, validate with the provided function
         tracing::debug!(
             "API key not found in Redis, validating externally: {}",
-            api_key
+            redact_api_key(api_key)
         );
 
         match validator(api_key.to_string()).await {
             Ok(Some(key_id)) => {
-                tracing::debug!("API key validated successfully: {}", api_key);
+                tracing::debug!("API key validated successfully: {}", redact_api_key(api_key));
 
                 // Save to Redis for future use
                 let rate_limit_config = config
@@ -183,7 +186,7 @@ impl RedisApiKeyStore {
                 ))
             }
             Ok(None) => {
-                tracing::warn!("API key validation failed: {}", api_key);
+                tracing::warn!("API key validation failed: {}", redact_api_key(api_key));
                 Ok(ApiKeyValidationResult::invalid())
             }
             Err(e) => {
@@ -230,7 +233,7 @@ impl ApiKeyStore for RedisApiKeyStore {
         let redis_key = self.get_redis_key(api_key);
         let config_key = self.get_config_key(api_key);
 
-        tracing::debug!("Validating API key: {}", api_key);
+        tracing::debug!("Validating API key: {}", redact_api_key(api_key));
 
         let mut conn = match self.get_connection().await {
             Ok(conn) => conn,
@@ -250,7 +253,7 @@ impl ApiKeyStore for RedisApiKeyStore {
         };
 
         if !key_exists {
-            tracing::debug!("API key not found: {}", api_key);
+            tracing::debug!("API key not found: {}", redact_api_key(api_key));
             return ApiKeyValidationResult::invalid();
         }
 

@@ -63,7 +63,10 @@ mod basic_unit_tests {
         // Test string representation (assuming Display is implemented)
         assert_eq!(format!("{:?}", email_key), "Email(\"user@domain.com\")");
         assert_eq!(format!("{:?}", ip_key), "Ip(\"10.0.0.1\")");
-        assert_eq!(format!("{:?}", api_key), "ApiKey(\"secret_key\")");
+        // API keys are redacted so they never reach the logs
+        let debug = format!("{:?}", api_key);
+        assert!(!debug.contains("secret_key"));
+        assert_eq!(debug, format!("ApiKey(\"{}\")", barnacle_rs::redact_api_key("secret_key")));
     }
 
     #[test]
