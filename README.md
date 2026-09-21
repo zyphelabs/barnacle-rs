@@ -47,11 +47,8 @@ use axum::{Router, routing::get};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = RedisBarnacleStore::from_url("redis://127.0.0.1:6379").await?;
-    let config = BarnacleConfig {
-        max_requests: 10,
-        window: std::time::Duration::from_secs(60),
-        reset_on_success: barnacle_rs::ResetOnSuccess::Not,
-    };
+    // 10 requests per minute, without resetting on success
+    let config = BarnacleConfig::new(10, std::time::Duration::from_secs(60));
     let layer = barnacle_rs::BarnacleLayer::builder()
         .with_store(store)
         .with_config(config)
@@ -353,6 +350,9 @@ let config = BarnacleConfig {
         Some(vec![200, 201])                        // Status codes to reset on
     ),
 };
+
+// Same thing without the reset, in one line
+let config = BarnacleConfig::new(100, Duration::from_secs(3600));
 ```
 
 ## Layer Options
@@ -370,11 +370,7 @@ let layer: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _> = Barnacl
     // Behind a load balancer: read the client from X-Forwarded-For, trusting only these hops
     .with_client_ip_strategy(ClientIpStrategy::trusted_proxies(["10.0.0.0/8"])?)
     // At most 10 failed key validations per client IP every 10 minutes
-    .with_failed_validation_limit(BarnacleConfig {
-        max_requests: 10,
-        window: Duration::from_secs(600),
-        reset_on_success: ResetOnSuccess::Not,
-    })
+    .with_failed_validation_limit(BarnacleConfig::new(10, Duration::from_secs(600)))
     // Let requests through when Redis is down or slower than 200ms
     .with_store_failure_policy(StoreFailurePolicy::FailOpen)
     .with_store_timeout(Duration::from_millis(200))
@@ -387,7 +383,7 @@ let layer: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _> = Barnacl
 | --- | --- | --- |
 | `with_scope` | `RateLimitScope::Path` | `Path`: one bucket per concrete path and method. `Route`: per route template (axum `MatchedPath`, needs `route_layer` or a layer on the route). `Named(name)`: one bucket per key for every route of the layer; layers with the same name share it. |
 | `with_client_ip_strategy` | `ClientIpStrategy::Legacy` | `Legacy`: peer address, then the first `X-Forwarded-For` entry, then `X-Real-IP` (behind a proxy every client shares the proxy IP). `PeerOnly`: peer address only. `TrustedProxies`: the first address, right to left, that is not a trusted proxy. |
-| `with_failed_validation_limit` | off | Counts validator failures for requests carrying a key, per client IP, in a bucket shared by all layers (`FAILED_VALIDATION_SCOPE`). Over the limit the validator is not called and the response is 429. |
+| `with_failed_validation_limit` | off | Counts authentication failures (validator errors that are 401 or 403) for requests carrying a key, per client IP, in a bucket shared by all layers (`FAILED_VALIDATION_SCOPE`). Over the limit the validator is not called and the response is 429. **Requires a client IP strategy that resolves the real client**, see below. |
 | `with_store_failure_policy` | `FailClosed` | `FailClosed` answers 503 when the store fails; `FailOpen` lets the request through without rate limiting. |
 | `with_store_timeout` | none | Store operations slower than this count as failures. |
 | `with_max_body_size` | none | Only applies when the key is read from the payload. Otherwise the body is streamed to the handler without being buffered, and its size limit is up to the application. |
@@ -398,6 +394,47 @@ The peer address is only available when the server is started with
 Inside your own `KeyExtractable` implementations, use `barnacle_rs::client_ip(&parts)` or
 `barnacle_rs::client_ip_key(&parts)` to get the client IP with the layer's strategy.
 
+### The failed validation limit is per client IP
+
+`with_failed_validation_limit` buckets by client IP, so it is only as precise as the
+configured `ClientIpStrategy`:
+
+- Behind a proxy or load balancer, use `ClientIpStrategy::trusted_proxies([...])`.
+- When the application is directly exposed, use `ClientIpStrategy::PeerOnly`.
+- With the default `Legacy` strategy behind a load balancer **every client is seen as the
+  balancer**: they all share one counter, so a single client sending bogus keys can get
+  everyone rejected for the length of the window.
+
+When no client IP can be resolved at all (no `ConnectInfo` and no usable header), the
+limit is skipped for that request rather than counted in a bucket shared by unrelated
+clients; the layer logs it at debug level.
+
+Only authentication failures are counted: a validator that answers 500 or 503 because its
+own backend blipped does not lock legitimate clients out, and neither does Barnacle's own
+"validator requires state" misconfiguration.
+
+### Resetting a named bucket
+
+A `RateLimitScope::Named` layer (and the failed validation bucket) counts under the scope
+name and the `ANY_METHOD` (`"*"`) method instead of a route and method. Build the matching
+context with `BarnacleContext::named`, either for `ResetOnSuccess::Multiple` or for a
+direct reset:
+
+```rust
+use barnacle_rs::{BarnacleContext, BarnacleKey, BarnacleStore, FAILED_VALIDATION_SCOPE};
+
+// The bucket a `RateLimitScope::Named("sdk")` layer counts for this client
+store.reset(&BarnacleContext::named(BarnacleKey::Ip("203.0.113.7".into()), "sdk")).await?;
+
+// Clear a client's failed validation counter
+store
+    .reset(&BarnacleContext::named(
+        BarnacleKey::Ip("203.0.113.7".into()),
+        FAILED_VALIDATION_SCOPE,
+    ))
+    .await?;
+```
+
 Rate limited responses carry `Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Remaining` and
 `X-RateLimit-Reset`, even when the error is converted into a custom error type that doesn't
 set them.
@@ -405,7 +442,12 @@ set them.
 ### Redis pool
 
 Without timeouts, a slow or unreachable Redis makes every request wait for a connection.
-`RedisBarnacleStore::from_url_with_options` sets them (500ms each by default):
+Every constructor that takes a URL (`RedisBarnacleStore::from_url`, `with_pool_config`,
+`RedisApiKeyStore::from_url`) applies the default `RedisPoolOptions`: 5s to open a
+connection, 2s to wait for a free one, 2s to check one before reusing it. Opening a
+connection is the slowest step (DNS, TCP, TLS, AUTH), so the create timeout is the one
+to keep generous: with the default `FailClosed` policy, a timeout there turns a healthy
+but distant Redis into a 503.
 
 ```rust
 let store = RedisBarnacleStore::from_url_with_options(
@@ -413,6 +455,9 @@ let store = RedisBarnacleStore::from_url_with_options(
     RedisPoolOptions { max_size: Some(32), ..Default::default() },
 )?;
 ```
+
+To bound how long a *request* waits, use `with_store_timeout` together with a
+`StoreFailurePolicy`, instead of pool timeouts short enough to break connecting.
 
 ## Automatic Route-Based Rate Limiting
 
@@ -451,10 +496,27 @@ redis-cli SET "barnacle:api_keys:$HASH" 1
 redis-cli SET "barnacle:api_keys:config:$HASH" '{"max_requests":100,"window":{"secs":3600,"nanos":0},"reset_on_success":"Not"}'
 ```
 
+Keys provisioned by 0.3 under their clear text name keep working: the first lookup moves
+the entry (and its config) to the hashed name with `RENAME`, which preserves the remaining
+TTL, and removes the clear text one. `invalidate_key` and `invalidate_all_keys` delete
+both forms.
+
+`ApiKeyStore::validate_key` returns `Result<ApiKeyValidationResult, BarnacleError>`:
+answer `Ok(ApiKeyValidationResult::invalid())` only when the key genuinely does not exist,
+and `Err(...)` when the lookup itself failed, so an outage is answered with a 5xx instead
+of looking like an invalid key (which would be a 401, and would count against the client's
+failed validation limit).
+
 ## Upgrading from 0.3
 
-- Redis keys for API keys now contain the SHA-256 of the key: counters and cached keys
-  written by 0.3 are ignored (counters restart, cached keys are validated again).
+- Redis keys for API keys now contain the SHA-256 of the key. Counters written by 0.3 are
+  ignored and restart. Keys the 0.3 way (`SET barnacle:api_keys:<key> 1`) stay valid:
+  `RedisApiKeyStore` moves them to the hashed name on first lookup, keeping the remaining
+  TTL, and deletes the clear text entry.
+- **Breaking**: `ApiKeyStore::validate_key` now returns
+  `Result<ApiKeyValidationResult, BarnacleError>`, so that an unreachable store is not
+  reported as an invalid key. Implementors must wrap their result in `Ok(...)` and return
+  `Err(...)` for infrastructure failures.
 - The `x-api-key` header only identifies the client when an API key validator is
   configured. Before, layers without a validator used any key sent by the client, so a
   new key per request bypassed the limit; those requests are now limited by client IP.
@@ -464,8 +526,14 @@ redis-cli SET "barnacle:api_keys:config:$HASH" '{"max_requests":100,"window":{"s
 - `BarnacleError` has a new `PayloadTooLarge` variant (413), and `BarnacleStore` has a new
   `peek` method. Its default implementation returns a store error, so custom stores must
   implement it to use `with_failed_validation_limit`.
-- `RedisBarnacleStore::from_url` and `with_pool_config` now use the default pool timeouts
-  (500ms); use `from_url_with_options` to change or disable them.
+- Every constructor that takes a Redis URL (`RedisBarnacleStore::from_url`,
+  `with_pool_config`, `RedisApiKeyStore::from_url`) now applies pool timeouts: 5s to open
+  a connection, 2s to wait for a free one, 2s to recycle. Before, a request could wait
+  forever for a connection. Use `from_url_with_options` to change or disable them.
+- `X-Forwarded-For` and `X-Real-IP` values are parsed as addresses, in every strategy:
+  a `host:port` hop (`203.0.113.9:51234`, `[2001:db8::1]:443`) is counted as its address
+  instead of a bucket of its own, and a value that is not an address is ignored instead of
+  becoming a bucket key.
 - Rate limited responses carry `Retry-After`; successful responses carry `X-RateLimit-Reset`.
 - The service accepts `Request<B>` with `B: HttpBody<Data = Bytes>` (e.g. `axum::body::Body`).
 

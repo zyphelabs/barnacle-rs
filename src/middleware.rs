@@ -1,7 +1,7 @@
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, MatchedPath, OriginalUri, Request};
 use axum::http::request::Parts;
-use axum::http::{header::CONTENT_LENGTH, Extensions, HeaderMap, Method, Response};
+use axum::http::{header::CONTENT_LENGTH, Extensions, HeaderMap, Method, Response, StatusCode};
 use axum::response::IntoResponse;
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use serde::de::DeserializeOwned;
@@ -31,9 +31,6 @@ use crate::{
 /// It is shared by every layer configured with
 /// [`BarnacleLayerBuilder::with_failed_validation_limit`].
 pub const FAILED_VALIDATION_SCOPE: &str = "@failed_api_key_validation";
-
-/// Method recorded in contexts that are not tied to a single route and method.
-const ANY_METHOD: &str = "*";
 
 /// Trait to extract the key from any payload type
 pub trait KeyExtractable {
@@ -116,8 +113,23 @@ where
     /// Count failed API key validations per client IP and reject clients over `limit`
     /// with 429 before the validator runs again.
     ///
-    /// Only requests that carry a non-empty API key are counted. The counter is shared
-    /// by every layer that sets a limit (see [`FAILED_VALIDATION_SCOPE`]).
+    /// Only requests that carry a non-empty API key and fail authentication (the
+    /// validator's error is a 401 or a 403) are counted; a validator that fails because
+    /// its own backend is down does not lock the client out. The counter is shared by
+    /// every layer that sets a limit (see [`FAILED_VALIDATION_SCOPE`]).
+    ///
+    /// # The limit is only as precise as the client IP
+    ///
+    /// The bucket is the client IP, so this needs a [`ClientIpStrategy`] that resolves
+    /// the real client: [`ClientIpStrategy::TrustedProxies`] behind a proxy, or
+    /// [`ClientIpStrategy::PeerOnly`] when the application is directly exposed. With the
+    /// default [`ClientIpStrategy::Legacy`] behind a load balancer every client is seen
+    /// as the balancer, so they all share one counter and a single attacker can get
+    /// everyone rejected for the length of the window.
+    ///
+    /// When no client IP can be resolved at all (e.g. no `ConnectInfo` and no usable
+    /// header) the limit is skipped for that request rather than counted in a bucket
+    /// shared by unrelated clients.
     pub fn with_failed_validation_limit(mut self, limit: BarnacleConfig) -> Self {
         self.options.failed_validation_limit = Some(limit);
         self
@@ -341,10 +353,33 @@ async fn handle_rate_limit_reset<S>(
 #[derive(Clone)]
 struct ClientIpStrategyExtension(Arc<ClientIpStrategy>);
 
+/// Parses one `X-Forwarded-For` (or `X-Real-IP`) hop.
+///
+/// Besides a bare address, proxies write hops as `SocketAddr` (`203.0.113.9:51234`
+/// from Azure Application Gateway, `[2001:db8::1]:443`) or as a bracketed v6 address
+/// without a port. Anything else (an obfuscated or relayed client value) is rejected,
+/// so it can never become a bucket key.
+fn parse_hop(hop: &str) -> Option<IpAddr> {
+    let hop = hop.trim();
+    if let Ok(ip) = hop.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    match hop.strip_prefix('[') {
+        // `[v6]` without a port: `SocketAddr` would reject it
+        Some(bracketed) => match bracketed.split_once(']') {
+            Some((address, "")) => address.parse::<IpAddr>().ok().filter(IpAddr::is_ipv6),
+            _ => hop.parse::<SocketAddr>().ok().map(|addr| addr.ip()),
+        },
+        None => hop.parse::<SocketAddr>().ok().map(|addr| addr.ip()),
+    }
+}
+
+/// First usable address of `name`, canonicalized; `None` when the header is missing
+/// or holds something that is not an address.
 fn header_ip(headers: &HeaderMap, name: &str) -> Option<String> {
     let value = headers.get(name)?.to_str().ok()?;
-    let ip = value.split(',').next().unwrap_or("").trim();
-    (!ip.is_empty() && ip != "unknown").then(|| ip.to_string())
+    let hop = value.split(',').next().unwrap_or("");
+    parse_hop(hop).map(|ip| ip.to_canonical().to_string())
 }
 
 fn resolve_client_ip(
@@ -380,8 +415,8 @@ fn resolve_client_ip(
                 .collect();
             let mut leftmost_trusted = None;
             for hop in hops.iter().rev() {
-                match hop.parse::<IpAddr>() {
-                    Ok(ip) => {
+                match parse_hop(hop) {
+                    Some(ip) => {
                         let ip = ip.to_canonical();
                         if !is_trusted(&ip) {
                             return Some(ip.to_string());
@@ -390,7 +425,7 @@ fn resolve_client_ip(
                     }
                     // Not an address (e.g. a client value relayed as is): nothing left
                     // of it can be trusted, and it must not become a bucket key
-                    Err(_) => break,
+                    None => break,
                 }
             }
             leftmost_trusted.or_else(|| peer.map(|ip| ip.to_string()))
@@ -398,16 +433,17 @@ fn resolve_client_ip(
     }
 }
 
+/// The IP-based key used when no other key is available.
+///
+/// The middleware passes its own strategy, so it never depends on the request
+/// extensions; [`client_ip_key`] reads it from them.
 fn fallback_key(
+    strategy: &ClientIpStrategy,
     extensions: &Extensions,
     headers: &HeaderMap,
     path: &str,
     method: &Method,
 ) -> BarnacleKey {
-    let strategy = extensions.get::<ClientIpStrategyExtension>();
-    let default_strategy = ClientIpStrategy::default();
-    let strategy = strategy.map_or(&default_strategy, |ext| ext.0.as_ref());
-
     match resolve_client_ip(extensions, headers, strategy) {
         Some(ip) => BarnacleKey::Ip(ip),
         // No client IP (e.g. local requests without ConnectInfo): one bucket per route + method
@@ -415,22 +451,45 @@ fn fallback_key(
     }
 }
 
+/// Strategy of the innermost Barnacle layer wrapping the request, the legacy one
+/// outside of a Barnacle layer.
+fn request_strategy(extensions: &Extensions) -> &ClientIpStrategy {
+    static LEGACY: ClientIpStrategy = ClientIpStrategy::Legacy;
+    extensions
+        .get::<ClientIpStrategyExtension>()
+        .map_or(&LEGACY, |extension| extension.0.as_ref())
+}
+
+/// Path the request is counted on: the original one, so that a route nested under a
+/// prefix keeps the same bucket inside and outside the middleware.
+fn request_path(parts: &Parts) -> &str {
+    parts
+        .extensions
+        .get::<OriginalUri>()
+        .map_or_else(|| parts.uri.path(), |original| original.path())
+}
+
 /// Client IP of the request, resolved with the [`ClientIpStrategy`] of the Barnacle
 /// layer that wraps it (the legacy strategy outside of a Barnacle layer).
 ///
 /// Useful in [`KeyExtractable`] implementations that fall back to the client IP.
 pub fn client_ip(parts: &Parts) -> Option<String> {
-    let default_strategy = ClientIpStrategy::default();
-    let strategy = parts
-        .extensions
-        .get::<ClientIpStrategyExtension>()
-        .map_or(&default_strategy, |ext| ext.0.as_ref());
-    resolve_client_ip(&parts.extensions, &parts.headers, strategy)
+    resolve_client_ip(
+        &parts.extensions,
+        &parts.headers,
+        request_strategy(&parts.extensions),
+    )
 }
 
 /// The IP-based key Barnacle falls back to when no other key is available.
 pub fn client_ip_key(parts: &Parts) -> BarnacleKey {
-    fallback_key(&parts.extensions, &parts.headers, parts.uri.path(), &parts.method)
+    fallback_key(
+        request_strategy(&parts.extensions),
+        &parts.extensions,
+        &parts.headers,
+        request_path(parts),
+        &parts.method,
+    )
 }
 
 /// The actual middleware that handles payload-based key extraction
@@ -620,13 +679,8 @@ where
         let request_modifier = self.request_modifier.clone();
         let options = self.options.clone();
         Box::pin(async move {
-            let current_path = req
-                .extensions()
-                .get::<OriginalUri>()
-                .map(|original_url| original_url.path().to_owned())
-                .unwrap_or(req.uri().path().to_owned());
-
             let (mut parts, body) = req.into_parts();
+            let current_path = request_path(&parts).to_owned();
             parts
                 .extensions
                 .insert(ClientIpStrategyExtension(options.client_ip_strategy.clone()));
@@ -642,18 +696,29 @@ where
 
             // Failed validations are counted per client IP, and only for requests that
             // carry a key: those are the ones that cost a lookup in the validator.
+            // Without a client IP the only bucket left would be shared by unrelated
+            // clients, so the limit is skipped instead of locking all of them out.
             let failed_validation = match (&api_key_validator, &options.failed_validation_limit) {
                 (Some(_), Some(limit)) if !api_key.is_empty() => {
-                    let context = BarnacleContext {
-                        key: fallback_key(&parts.extensions, &parts.headers, &current_path, &parts.method),
-                        path: FAILED_VALIDATION_SCOPE.to_string(),
-                        method: ANY_METHOD.to_string(),
-                    };
-                    Some((context, limit))
+                    match resolve_client_ip(&parts.extensions, &parts.headers, &options.client_ip_strategy) {
+                        Some(ip) => Some((
+                            BarnacleContext::named(BarnacleKey::Ip(ip), FAILED_VALIDATION_SCOPE),
+                            limit,
+                        )),
+                        None => {
+                            debug!(
+                                "No client IP resolved: skipping the failed API key validation limit"
+                            );
+                            None
+                        }
+                    }
                 }
                 _ => None,
             };
 
+            // Reading the counter before the validator runs is what keeps a brute-force
+            // client from costing a key lookup per attempt: it can't be merged with the
+            // increment below, which only happens after the validator answered.
             if let Some((context, limit)) = &failed_validation {
                 if let Err(e) = call_store(options.store_timeout, store.peek(context, limit)).await {
                     if let Some(response) = store_error_response::<E>(e, options.store_failure_policy) {
@@ -663,6 +728,8 @@ where
                 }
             }
 
+            // A failure Barnacle itself caused must never count against the client
+            let mut validator_answered = true;
             let validation_result = if let Some(validator) = api_key_validator.as_ref() {
                 let is_stateless_validator = TypeId::of::<V>() == TypeId::of::<()>();
                 let is_unit_state = TypeId::of::<State>() == TypeId::of::<()>();
@@ -676,6 +743,7 @@ where
                         }
                         None => {
                             // Return a more appropriate error for missing validator state
+                            validator_answered = false;
                             Err(E::from(BarnacleError::custom("Barnacle: API key validator requires state, but none was provided. Use with_state() or use () for stateless validators.", None)))
                         }
                     }
@@ -684,9 +752,18 @@ where
                 Ok(())
             };
             if let Err(e) = validation_result {
-                debug!("API key validation failed");
-                if let Some((context, limit)) = &failed_validation {
-                    match call_store(options.store_timeout, store.increment(context, limit)).await {
+                let response = e.into_response();
+                debug!("API key validation failed with status {}", response.status());
+                // Only an authentication failure says anything about the client: a
+                // validator that answers 500 or 503 because its own backend blipped
+                // must not lock legitimate clients out for the whole window.
+                let authentication_failed = validator_answered
+                    && matches!(
+                        response.status(),
+                        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                    );
+                if let Some((context, limit)) = failed_validation.filter(|_| authentication_failed) {
+                    match call_store(options.store_timeout, store.increment(&context, limit)).await {
                         Ok(_) => {}
                         // Another request reached the limit in the meantime
                         Err(limit_error @ BarnacleError::RateLimitExceeded { .. }) => {
@@ -697,7 +774,7 @@ where
                         }
                     }
                 }
-                return Ok(e.into_response());
+                return Ok(response);
             }
             // Only a validated key identifies the client: without a validator anyone could
             // send a different key per request to get a fresh bucket every time
@@ -718,13 +795,18 @@ where
             } else {
                 Ok(parts)
             };
-            let parts = match modified_parts {
+            let mut parts = match modified_parts {
                 Ok(modified_parts) => modified_parts,
                 Err(e) => {
                     debug!("Request modifier returned an error");
                     return Ok(e.into_response());
                 }
             };
+            // A modifier that rebuilds the parts may have dropped the extension the
+            // public `client_ip` helpers read, in the key extractor or in the handler
+            parts
+                .extensions
+                .insert(ClientIpStrategyExtension(options.client_ip_strategy.clone()));
 
             // The body is only buffered when the key has to be read from the payload
             let reads_payload = api_key_used.is_none() && TypeId::of::<T>() != TypeId::of::<()>();
@@ -732,7 +814,13 @@ where
                 (BarnacleKey::ApiKey(api_key), Body::new(body))
             } else if !reads_payload {
                 (
-                    fallback_key(&parts.extensions, &parts.headers, &current_path, &parts.method),
+                    fallback_key(
+                        &options.client_ip_strategy,
+                        &parts.extensions,
+                        &parts.headers,
+                        &current_path,
+                        &parts.method,
+                    ),
                     Body::new(body),
                 )
             } else {
@@ -754,25 +842,35 @@ where
                     Ok(payload) => payload.extract_key(&parts),
                     Err(_) => {
                         debug!("Payload key not found, using the client IP");
-                        fallback_key(&parts.extensions, &parts.headers, &current_path, &parts.method)
+                        fallback_key(
+                            &options.client_ip_strategy,
+                            &parts.extensions,
+                            &parts.headers,
+                            &current_path,
+                            &parts.method,
+                        )
                     }
                 };
                 (key, Body::from(bytes))
             };
 
-            let (path, method) = match &options.scope {
-                RateLimitScope::Path => (current_path, parts.method.as_str().to_string()),
-                RateLimitScope::Route => (
-                    parts
+            let rate_limit_context = match &options.scope {
+                RateLimitScope::Path => BarnacleContext {
+                    key,
+                    path: current_path,
+                    method: parts.method.as_str().to_string(),
+                },
+                RateLimitScope::Route => BarnacleContext {
+                    key,
+                    path: parts
                         .extensions
                         .get::<MatchedPath>()
                         .map(|matched| matched.as_str().to_owned())
                         .unwrap_or(current_path),
-                    parts.method.as_str().to_string(),
-                ),
-                RateLimitScope::Named(name) => (name.clone(), ANY_METHOD.to_string()),
+                    method: parts.method.as_str().to_string(),
+                },
+                RateLimitScope::Named(name) => BarnacleContext::named(key, name.clone()),
             };
-            let rate_limit_context = BarnacleContext { key, path, method };
 
             let result = match call_store(options.store_timeout, store.increment(&rate_limit_context, &config)).await {
                 Ok(result) => Some(result),

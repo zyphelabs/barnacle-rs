@@ -4,6 +4,10 @@ use std::time::Duration;
 /// Special constant to indicate a placeholder key that should be replaced
 pub const NO_KEY: &str = "__BARNACLE_NO_KEY_PLACEHOLDER__";
 
+/// Method recorded in contexts that are not tied to a single route and method,
+/// i.e. the buckets built by [`BarnacleContext::named`].
+pub const ANY_METHOD: &str = "*";
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ResetOnSuccess {
     Not,
@@ -30,6 +34,15 @@ impl Default for BarnacleConfig {
 }
 
 impl BarnacleConfig {
+    /// Allow `max_requests` per `window`, without resetting on success.
+    pub fn new(max_requests: u32, window: Duration) -> Self {
+        Self {
+            max_requests,
+            window,
+            reset_on_success: ResetOnSuccess::Not,
+        }
+    }
+
     /// Check if a status code should be considered successful for rate limit reset
     pub fn is_success_status(&self, status_code: u16) -> bool {
         match &self.reset_on_success {
@@ -167,6 +180,21 @@ impl BarnacleContext {
             key: BarnacleKey::Custom(NO_KEY.to_string()),
             path: path.into(),
             method: method.into(),
+        }
+    }
+
+    /// Context of a bucket that is not tied to a single route and method: the one
+    /// counted by a [`RateLimitScope::Named`] layer, or the failed validation bucket
+    /// (`barnacle_rs::FAILED_VALIDATION_SCOPE`).
+    ///
+    /// Build the context this way to reset such a bucket, either through
+    /// [`ResetOnSuccess::Multiple`] or with a direct `store.reset` call; `name` is the
+    /// scope name and the method is always [`ANY_METHOD`].
+    pub fn named(key: BarnacleKey, name: impl Into<String>) -> Self {
+        Self {
+            key,
+            path: name.into(),
+            method: ANY_METHOD.to_string(),
         }
     }
 }

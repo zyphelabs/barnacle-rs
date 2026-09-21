@@ -60,9 +60,9 @@ pub use middleware::{
 };
 pub use tracing;
 pub use types::{
-    hash_api_key, redact_api_key, ApiKeyConfig, BarnacleConfig, BarnacleContext, BarnacleKey,
-    BarnacleResult, ClientIpStrategy, RateLimitScope, ResetOnSuccess, StaticApiKeyConfig,
-    StoreFailurePolicy,
+    hash_api_key, redact_api_key, ApiKeyConfig, ApiKeyValidationResult, BarnacleConfig,
+    BarnacleContext, BarnacleKey, BarnacleResult, ClientIpStrategy, RateLimitScope, ResetOnSuccess,
+    StaticApiKeyConfig, StoreFailurePolicy, ANY_METHOD,
 };
 
 // Redis-specific exports (only available with "redis" feature)
@@ -101,6 +101,12 @@ pub trait BarnacleStore: Clone + Send + Sync {
     /// running the validator again. The default implementation returns a store error,
     /// so a store without `peek` is handled by the layer's [`StoreFailurePolicy`]
     /// (rejected with the default `FailClosed`) instead of silently skipping the limit.
+    ///
+    /// It cannot be merged with the [`BarnacleStore::increment`] of the request: the
+    /// validator runs in between (that is the point of reading the counter first), and
+    /// the increment that follows targets a different bucket with a different config.
+    /// A request carrying an API key therefore costs one round trip here and one there
+    /// when a failed validation limit is configured.
     async fn peek(
         &self,
         context: &BarnacleContext,

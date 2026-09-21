@@ -119,20 +119,24 @@ fn reset_after(ttl: i64, config: &BarnacleConfig) -> Duration {
     }
 }
 
-/// Connection pool settings for [`RedisBarnacleStore::from_url_with_options`].
+/// Connection pool settings for [`RedisBarnacleStore::from_url_with_options`] and
+/// [`crate::RedisApiKeyStore::from_url_with_options`].
 ///
 /// Without timeouts a slow or unreachable Redis makes every rate limited request
-/// wait indefinitely for a connection.
+/// wait indefinitely for a connection. The defaults are meant to survive a slow TLS
+/// handshake or a cross-AZ connect: use [`crate::StoreFailurePolicy::FailOpen`] or
+/// `with_store_timeout` to bound the wait a request is willing to accept, rather than
+/// timeouts so short that opening a connection normally fails.
 #[cfg(feature = "redis")]
 #[derive(Clone, Debug)]
 pub struct RedisPoolOptions {
     /// Maximum number of connections (deadpool default: 2 × CPU cores)
     pub max_size: Option<usize>,
-    /// Maximum time to wait for a free connection
+    /// Maximum time to wait for a free connection (default: 2s)
     pub wait_timeout: Option<Duration>,
-    /// Maximum time to open a new connection
+    /// Maximum time to open a new connection (default: 5s)
     pub create_timeout: Option<Duration>,
-    /// Maximum time to check a connection before reusing it
+    /// Maximum time to check a connection before reusing it (default: 2s)
     pub recycle_timeout: Option<Duration>,
 }
 
@@ -141,20 +145,33 @@ impl Default for RedisPoolOptions {
     fn default() -> Self {
         Self {
             max_size: None,
-            wait_timeout: Some(Duration::from_millis(500)),
-            create_timeout: Some(Duration::from_millis(500)),
-            recycle_timeout: Some(Duration::from_millis(500)),
+            wait_timeout: Some(Duration::from_secs(2)),
+            // Opening a connection is the slowest step (DNS, TCP, TLS, AUTH): a short
+            // timeout here turns a healthy but distant Redis into a 503
+            create_timeout: Some(Duration::from_secs(5)),
+            recycle_timeout: Some(Duration::from_secs(2)),
         }
     }
 }
 
+/// Builds a pool with the given options, shared by both Redis-backed stores.
 #[cfg(feature = "redis")]
-fn create_pool(
+pub(crate) fn create_pool(
     url: &str,
-    pool_config: Option<deadpool_redis::PoolConfig>,
+    options: &RedisPoolOptions,
 ) -> Result<Pool, deadpool_redis::PoolError> {
+    let mut pool_config = deadpool_redis::PoolConfig::default();
+    if let Some(max_size) = options.max_size {
+        pool_config.max_size = max_size;
+    }
+    pool_config.timeouts = deadpool_redis::Timeouts {
+        wait: options.wait_timeout,
+        create: options.create_timeout,
+        recycle: options.recycle_timeout,
+    };
+
     let mut cfg = deadpool_redis::Config::from_url(url);
-    cfg.pool = pool_config;
+    cfg.pool = Some(pool_config);
     cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1))
         .map_err(|e| {
             deadpool_redis::PoolError::Backend(deadpool_redis::redis::RedisError::from(
@@ -201,16 +218,7 @@ impl RedisBarnacleStore {
         url: &str,
         options: RedisPoolOptions,
     ) -> Result<Self, deadpool_redis::PoolError> {
-        let mut pool_config = deadpool_redis::PoolConfig::default();
-        if let Some(max_size) = options.max_size {
-            pool_config.max_size = max_size;
-        }
-        pool_config.timeouts = deadpool_redis::Timeouts {
-            wait: options.wait_timeout,
-            create: options.create_timeout,
-            recycle: options.recycle_timeout,
-        };
-        Ok(Self::new(create_pool(url, Some(pool_config))?))
+        Ok(Self::new(create_pool(url, &options)?))
     }
 }
 
