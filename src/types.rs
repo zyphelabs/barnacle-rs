@@ -154,9 +154,12 @@ impl ClientIpStrategy {
             .into_iter()
             .map(|proxy| {
                 let proxy = proxy.as_ref().trim();
-                proxy
-                    .parse::<ipnet::IpNet>()
-                    .or_else(|err| proxy.parse::<std::net::IpAddr>().map(ipnet::IpNet::from).map_err(|_| err))
+                proxy.parse::<ipnet::IpNet>().or_else(|err| {
+                    proxy
+                        .parse::<std::net::IpAddr>()
+                        .map(ipnet::IpNet::from)
+                        .map_err(|_| err)
+                })
             })
             .collect::<Result<Vec<_>, _>>()
             .map(ClientIpStrategy::TrustedProxies)
@@ -254,10 +257,7 @@ impl ApiKeyConfig {
         Default::default()
     }
 
-    pub fn custom(
-        header_name: String,
-        cache_ttl_seconds: u64,
-    ) -> Self {
+    pub fn custom(header_name: String, cache_ttl_seconds: u64) -> Self {
         Self {
             header_name,
             cache_ttl_seconds, // 1 hour default

@@ -66,7 +66,10 @@ mod basic_unit_tests {
         // API keys are redacted so they never reach the logs
         let debug = format!("{:?}", api_key);
         assert!(!debug.contains("secret_key"));
-        assert_eq!(debug, format!("ApiKey(\"{}\")", barnacle_rs::redact_api_key("secret_key")));
+        assert_eq!(
+            debug,
+            format!("ApiKey(\"{}\")", barnacle_rs::redact_api_key("secret_key"))
+        );
     }
 
     #[test]
@@ -127,25 +130,43 @@ mod basic_unit_tests {
 
 #[cfg(test)]
 mod barnacle_layer_unit_tests {
-    use axum::{body::Body, http::{request::Parts, Request}};
+    use axum::{
+        body::Body,
+        http::{request::Parts, Request},
+    };
     use barnacle_rs::{ApiKeyConfig, BarnacleError};
     use reqwest::Method;
     use std::sync::Arc;
 
     #[derive(Clone)]
-    struct State { allowed: String }
+    struct State {
+        allowed: String,
+    }
 
     fn build_state(allowed: &str) -> State {
-        State { allowed: allowed.to_string() }
+        State {
+            allowed: allowed.to_string(),
+        }
     }
 
     fn build_parts() -> Arc<Parts> {
-        let req = Request::builder().uri("/test").method(Method::GET).body(Body::empty()).unwrap();
+        let req = Request::builder()
+            .uri("/test")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap();
         let (parts, _) = req.into_parts();
         Arc::new(parts)
     }
 
-    fn api_key_validator() -> impl Fn(String, ApiKeyConfig, Arc<Parts>, State) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), BarnacleError>> + Send>> + Clone {
+    fn api_key_validator() -> impl Fn(
+        String,
+        ApiKeyConfig,
+        Arc<Parts>,
+        State,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), BarnacleError>> + Send>,
+    > + Clone {
         |api_key: String, _api_key_config: ApiKeyConfig, _parts: Arc<Parts>, state: State| {
             Box::pin(async move {
                 if state.allowed == api_key {
@@ -163,7 +184,13 @@ mod barnacle_layer_unit_tests {
         let validator = api_key_validator();
         let parts = build_parts();
         // Valid key
-        let result = validator("test-key".to_string(), ApiKeyConfig::default(), parts.clone(), state.clone()).await;
+        let result = validator(
+            "test-key".to_string(),
+            ApiKeyConfig::default(),
+            parts.clone(),
+            state.clone(),
+        )
+        .await;
         assert!(result.is_ok());
         // Invalid key
         let result = validator("invalid".to_string(), ApiKeyConfig::default(), parts, state).await;

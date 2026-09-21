@@ -40,7 +40,9 @@ fn unique_context() -> BarnacleContext {
 }
 
 fn redis_key(context: &BarnacleContext) -> String {
-    let BarnacleKey::Custom(id) = &context.key else { unreachable!() };
+    let BarnacleKey::Custom(id) = &context.key else {
+        unreachable!()
+    };
     format!("barnacle:custom:{}:{}:{}", id, context.method, context.path)
 }
 
@@ -57,7 +59,10 @@ async fn concurrent_requests_never_exceed_the_limit() {
         tokio::spawn(async move { store.increment(&context, &config).await })
     });
     let results = futures::future::join_all(attempts).await;
-    let allowed = results.iter().filter(|result| matches!(result, Ok(Ok(_)))).count();
+    let allowed = results
+        .iter()
+        .filter(|result| matches!(result, Ok(Ok(_))))
+        .count();
     assert_eq!(allowed, 10);
 }
 
@@ -77,7 +82,13 @@ async fn counters_without_expiry_are_repaired() {
         .unwrap();
 
     let error = store.increment(&context, &config).await.unwrap_err();
-    assert!(matches!(error, BarnacleError::RateLimitExceeded { retry_after: 30, .. }));
+    assert!(matches!(
+        error,
+        BarnacleError::RateLimitExceeded {
+            retry_after: 30,
+            ..
+        }
+    ));
     let ttl: i64 = deadpool_redis::redis::cmd("TTL")
         .arg(redis_key(&context))
         .query_async(&mut conn)
@@ -102,7 +113,13 @@ async fn peek_repairs_counters_without_expiry() {
         .unwrap();
 
     let error = store.peek(&context, &config).await.unwrap_err();
-    assert!(matches!(error, BarnacleError::RateLimitExceeded { retry_after: 30, .. }));
+    assert!(matches!(
+        error,
+        BarnacleError::RateLimitExceeded {
+            retry_after: 30,
+            ..
+        }
+    ));
     let ttl: i64 = deadpool_redis::redis::cmd("TTL")
         .arg(redis_key(&context))
         .query_async(&mut conn)
@@ -119,7 +136,9 @@ async fn increments_report_remaining_and_reset() {
 
     let first = store.increment(&context, &config).await.unwrap();
     assert_eq!(first.remaining, 2);
-    assert!(first.retry_after.is_some_and(|reset| reset.as_secs() <= 30 && reset.as_secs() > 0));
+    assert!(first
+        .retry_after
+        .is_some_and(|reset| reset.as_secs() <= 30 && reset.as_secs() > 0));
     let peeked = store.peek(&context, &config).await.unwrap();
     assert_eq!(peeked.remaining, 2, "peek must not increment");
 
@@ -129,7 +148,10 @@ async fn increments_report_remaining_and_reset() {
     assert!(store.peek(&context, &config).await.is_err());
 
     store.reset(&context).await.unwrap();
-    assert_eq!(store.increment(&context, &config).await.unwrap().remaining, 2);
+    assert_eq!(
+        store.increment(&context, &config).await.unwrap().remaining,
+        2
+    );
 }
 
 #[tokio::test]
@@ -151,7 +173,10 @@ async fn api_keys_are_not_stored_in_clear_text() {
         .unwrap();
     assert!(clear.is_empty(), "found {clear:?}");
     let hashed: Vec<String> = deadpool_redis::redis::cmd("KEYS")
-        .arg(format!("barnacle:api_keys:{}:GET:/test", hash_api_key(&api_key)))
+        .arg(format!(
+            "barnacle:api_keys:{}:GET:/test",
+            hash_api_key(&api_key)
+        ))
         .query_async(&mut conn)
         .await
         .unwrap();
@@ -170,6 +195,9 @@ async fn unreachable_redis_fails_fast_with_pool_timeouts() {
     )
     .unwrap();
     let started = std::time::Instant::now();
-    assert!(store.increment(&unique_context(), &limit(5, 30)).await.is_err());
+    assert!(store
+        .increment(&unique_context(), &limit(5, 30))
+        .await
+        .is_err());
     assert!(started.elapsed() < Duration::from_secs(2));
 }

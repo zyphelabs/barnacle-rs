@@ -42,7 +42,11 @@ impl MemoryStore {
     }
 
     fn entry(context: &BarnacleContext) -> Bucket {
-        (context.key.clone(), context.path.clone(), context.method.clone())
+        (
+            context.key.clone(),
+            context.path.clone(),
+            context.method.clone(),
+        )
     }
 }
 
@@ -56,7 +60,11 @@ impl BarnacleStore for MemoryStore {
         let mut counters = self.counters.lock().unwrap();
         let count = counters.entry(Self::entry(context)).or_insert(0);
         if *count >= config.max_requests {
-            return Err(BarnacleError::rate_limit_exceeded(0, 42, config.max_requests));
+            return Err(BarnacleError::rate_limit_exceeded(
+                0,
+                42,
+                config.max_requests,
+            ));
         }
         *count += 1;
         Ok(BarnacleResult {
@@ -79,7 +87,11 @@ impl BarnacleStore for MemoryStore {
         let counters = self.counters.lock().unwrap();
         let count = counters.get(&Self::entry(context)).copied().unwrap_or(0);
         if count >= config.max_requests {
-            return Err(BarnacleError::rate_limit_exceeded(0, 42, config.max_requests));
+            return Err(BarnacleError::rate_limit_exceeded(
+                0,
+                42,
+                config.max_requests,
+            ));
         }
         Ok(BarnacleResult {
             allowed: true,
@@ -105,7 +117,11 @@ impl BarnacleStore for BrokenStore {
         match self.delay {
             Some(delay) => {
                 tokio::time::sleep(delay).await;
-                Ok(BarnacleResult { allowed: true, remaining: 1, retry_after: None })
+                Ok(BarnacleResult {
+                    allowed: true,
+                    remaining: 1,
+                    retry_after: None,
+                })
             }
             None => Err(BarnacleError::store_error("store down")),
         }
@@ -145,7 +161,8 @@ type ValidationFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), BarnacleError>> + Send>>;
 
 fn validator(
-) -> impl Fn(String, ApiKeyConfig, Arc<Parts>, ()) -> ValidationFuture + Clone + Send + Sync + 'static {
+) -> impl Fn(String, ApiKeyConfig, Arc<Parts>, ()) -> ValidationFuture + Clone + Send + Sync + 'static
+{
     |api_key: String, _config: ApiKeyConfig, _parts: Arc<Parts>, _state: ()| {
         Box::pin(async move {
             if api_key.is_empty() {
@@ -199,7 +216,12 @@ mod scope {
         let store = MemoryStore::default();
         let app = app(store.clone(), RateLimitScope::Path);
         for id in 0..5 {
-            let req = with_peer(request("GET", &format!("/users/{id}")).body(Body::empty()).unwrap(), "1.1.1.1:1");
+            let req = with_peer(
+                request("GET", &format!("/users/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+                "1.1.1.1:1",
+            );
             assert_eq!(send(&app, req).await.status(), StatusCode::OK);
         }
     }
@@ -211,43 +233,86 @@ mod scope {
         let statuses = {
             let mut statuses = vec![];
             for id in 0..3 {
-                let req = with_peer(request("GET", &format!("/users/{id}")).body(Body::empty()).unwrap(), "1.1.1.1:1");
+                let req = with_peer(
+                    request("GET", &format!("/users/{id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                    "1.1.1.1:1",
+                );
                 statuses.push(send(&app, req).await.status());
             }
             statuses
         };
-        assert_eq!(statuses, [StatusCode::OK, StatusCode::OK, StatusCode::TOO_MANY_REQUESTS]);
-        assert_eq!(store.count(BarnacleKey::Ip("1.1.1.1".into()), "/users/{id}", "GET"), 2);
+        assert_eq!(
+            statuses,
+            [
+                StatusCode::OK,
+                StatusCode::OK,
+                StatusCode::TOO_MANY_REQUESTS
+            ]
+        );
+        assert_eq!(
+            store.count(BarnacleKey::Ip("1.1.1.1".into()), "/users/{id}", "GET"),
+            2
+        );
     }
 
     #[tokio::test]
     async fn named_scope_shares_one_bucket_across_routes_and_methods() {
         let store = MemoryStore::default();
         let app = app(store.clone(), RateLimitScope::Named("sdk".into()));
-        let first = with_peer(request("GET", "/users/1").body(Body::empty()).unwrap(), "1.1.1.1:1");
-        let second = with_peer(request("POST", "/users/2/avatar").body(Body::empty()).unwrap(), "1.1.1.1:1");
-        let third = with_peer(request("GET", "/users/3").body(Body::empty()).unwrap(), "1.1.1.1:1");
+        let first = with_peer(
+            request("GET", "/users/1").body(Body::empty()).unwrap(),
+            "1.1.1.1:1",
+        );
+        let second = with_peer(
+            request("POST", "/users/2/avatar")
+                .body(Body::empty())
+                .unwrap(),
+            "1.1.1.1:1",
+        );
+        let third = with_peer(
+            request("GET", "/users/3").body(Body::empty()).unwrap(),
+            "1.1.1.1:1",
+        );
         assert_eq!(send(&app, first).await.status(), StatusCode::OK);
         assert_eq!(send(&app, second).await.status(), StatusCode::OK);
-        assert_eq!(send(&app, third).await.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(store.count(BarnacleKey::Ip("1.1.1.1".into()), "sdk", "*"), 2);
+        assert_eq!(
+            send(&app, third).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            store.count(BarnacleKey::Ip("1.1.1.1".into()), "sdk", "*"),
+            2
+        );
     }
 
     #[tokio::test]
     async fn named_contexts_reset_the_bucket_the_layer_counts() {
         let store = MemoryStore::default();
         let app = app(store.clone(), RateLimitScope::Named("sdk".into()));
-        let call = || with_peer(request("GET", "/users/1").body(Body::empty()).unwrap(), "1.1.1.1:1");
+        let call = || {
+            with_peer(
+                request("GET", "/users/1").body(Body::empty()).unwrap(),
+                "1.1.1.1:1",
+            )
+        };
 
         assert_eq!(send(&app, call()).await.status(), StatusCode::OK);
         assert_eq!(send(&app, call()).await.status(), StatusCode::OK);
-        assert_eq!(send(&app, call()).await.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            send(&app, call()).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
 
         // The context a user can build must address the very same bucket
         let context = BarnacleContext::named(BarnacleKey::Ip("1.1.1.1".into()), "sdk");
         assert_eq!(context.method, ANY_METHOD);
         store.reset(&context).await.unwrap();
-        assert_eq!(store.count(BarnacleKey::Ip("1.1.1.1".into()), "sdk", ANY_METHOD), 0);
+        assert_eq!(
+            store.count(BarnacleKey::Ip("1.1.1.1".into()), "sdk", ANY_METHOD),
+            0
+        );
         assert_eq!(send(&app, call()).await.status(), StatusCode::OK);
     }
 
@@ -260,10 +325,13 @@ mod scope {
             .build()
             .unwrap();
         let inner = Router::new()
-            .route("/thing", get(|req: Request<Body>| async move {
-                let (parts, _) = req.into_parts();
-                format!("{:?}", client_ip_key(&parts))
-            }))
+            .route(
+                "/thing",
+                get(|req: Request<Body>| async move {
+                    let (parts, _) = req.into_parts();
+                    format!("{:?}", client_ip_key(&parts))
+                }),
+            )
             .route_layer(layer);
         let app = Router::new().nest("/api", inner);
 
@@ -288,10 +356,13 @@ mod client_ip_strategy {
             .unwrap();
         Router::new()
             .route("/", get(|| async { "ok" }))
-            .route("/ip", get(|req: Request<Body>| async move {
-                let (parts, _) = req.into_parts();
-                client_ip(&parts).unwrap_or_default()
-            }))
+            .route(
+                "/ip",
+                get(|req: Request<Body>| async move {
+                    let (parts, _) = req.into_parts();
+                    client_ip(&parts).unwrap_or_default()
+                }),
+            )
             .route_layer(layer)
     }
 
@@ -418,7 +489,14 @@ mod client_ip_strategy {
     #[tokio::test]
     async fn trusted_proxies_stop_at_hops_that_are_not_addresses() {
         // Garbage must never become a bucket key: the walk stops at the last proxy
-        for garbage in ["random-token-1", "_hidden", "unknown", "[2001:db8::1", "203.0.113.9:", "[]"] {
+        for garbage in [
+            "random-token-1",
+            "_hidden",
+            "unknown",
+            "[2001:db8::1",
+            "203.0.113.9:",
+            "[]",
+        ] {
             assert_eq!(client_of(garbage).await, ["10.1.2.3"], "hop {garbage:?}");
         }
     }
@@ -473,10 +551,13 @@ mod client_ip_strategy {
                 .build()
                 .unwrap();
         let app = Router::new()
-            .route("/ip", get(|req: Request<Body>| async move {
-                let (parts, _) = req.into_parts();
-                client_ip(&parts).unwrap_or_default()
-            }))
+            .route(
+                "/ip",
+                get(|req: Request<Body>| async move {
+                    let (parts, _) = req.into_parts();
+                    client_ip(&parts).unwrap_or_default()
+                }),
+            )
             .route_layer(layer);
 
         let req = request("GET", "/ip")
@@ -502,11 +583,19 @@ mod api_keys {
             .with_failed_validation_limit(limit(3))
             .build()
             .unwrap();
-        Router::new().route("/", get(|| async { "ok" })).route_layer(layer)
+        Router::new()
+            .route("/", get(|| async { "ok" }))
+            .route_layer(layer)
     }
 
     fn keyed(key: &str, peer: &str) -> Request<Body> {
-        with_peer(request("GET", "/").header("x-api-key", key).body(Body::empty()).unwrap(), peer)
+        with_peer(
+            request("GET", "/")
+                .header("x-api-key", key)
+                .body(Body::empty())
+                .unwrap(),
+            peer,
+        )
     }
 
     #[tokio::test]
@@ -523,7 +612,11 @@ mod api_keys {
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(response.headers().contains_key("retry-after"));
         assert_eq!(
-            store.count(BarnacleKey::Ip("1.1.1.1".into()), FAILED_VALIDATION_SCOPE, "*"),
+            store.count(
+                BarnacleKey::Ip("1.1.1.1".into()),
+                FAILED_VALIDATION_SCOPE,
+                "*"
+            ),
             3
         );
 
@@ -537,11 +630,18 @@ mod api_keys {
         let store = MemoryStore::default();
         let app = app(store.clone());
         for _ in 0..5 {
-            let req = with_peer(request("GET", "/").body(Body::empty()).unwrap(), "1.1.1.1:1");
+            let req = with_peer(
+                request("GET", "/").body(Body::empty()).unwrap(),
+                "1.1.1.1:1",
+            );
             assert_eq!(send(&app, req).await.status(), StatusCode::UNAUTHORIZED);
         }
         assert_eq!(
-            store.count(BarnacleKey::Ip("1.1.1.1".into()), FAILED_VALIDATION_SCOPE, "*"),
+            store.count(
+                BarnacleKey::Ip("1.1.1.1".into()),
+                FAILED_VALIDATION_SCOPE,
+                "*"
+            ),
             0
         );
     }
@@ -550,8 +650,14 @@ mod api_keys {
     async fn valid_keys_are_counted_by_key() {
         let store = MemoryStore::default();
         let app = app(store.clone());
-        assert_eq!(send(&app, keyed(VALID_KEY, "1.1.1.1:1")).await.status(), StatusCode::OK);
-        assert_eq!(store.count(BarnacleKey::ApiKey(VALID_KEY.into()), "/", "GET"), 1);
+        assert_eq!(
+            send(&app, keyed(VALID_KEY, "1.1.1.1:1")).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            store.count(BarnacleKey::ApiKey(VALID_KEY.into()), "/", "GET"),
+            1
+        );
     }
 
     #[tokio::test]
@@ -575,15 +681,19 @@ mod api_keys {
             .any(|(_, path, _)| path == FAILED_VALIDATION_SCOPE));
 
         // A valid key still gets through
-        let req = request("GET", "/").header("x-api-key", VALID_KEY).body(Body::empty()).unwrap();
+        let req = request("GET", "/")
+            .header("x-api-key", VALID_KEY)
+            .body(Body::empty())
+            .unwrap();
         assert_eq!(send(&app, req).await.status(), StatusCode::OK);
     }
 
     /// Layer whose validator always fails with `error`
     fn failing_app(store: MemoryStore, error: fn() -> BarnacleError) -> Router {
-        let validator = move |_key: String, _config: ApiKeyConfig, _parts: Arc<Parts>, _state: ()| {
-            Box::pin(async move { Err(error()) }) as ValidationFuture
-        };
+        let validator =
+            move |_key: String, _config: ApiKeyConfig, _parts: Arc<Parts>, _state: ()| {
+                Box::pin(async move { Err(error()) }) as ValidationFuture
+            };
         let layer: BarnacleLayer<(), MemoryStore, (), BarnacleError, _> = BarnacleLayer::builder()
             .with_store(store)
             .with_config(limit(100))
@@ -592,7 +702,9 @@ mod api_keys {
             .with_failed_validation_limit(limit(3))
             .build()
             .unwrap();
-        Router::new().route("/", get(|| async { "ok" })).route_layer(layer)
+        Router::new()
+            .route("/", get(|| async { "ok" }))
+            .route_layer(layer)
     }
 
     async fn failures_counted(error: fn() -> BarnacleError) -> u32 {
@@ -600,30 +712,44 @@ mod api_keys {
         let app = failing_app(store.clone(), error);
         let response = send(&app, keyed("some-key", "1.1.1.1:1")).await;
         assert_eq!(response.status(), error().status_code());
-        store.count(BarnacleKey::Ip("1.1.1.1".into()), FAILED_VALIDATION_SCOPE, ANY_METHOD)
+        store.count(
+            BarnacleKey::Ip("1.1.1.1".into()),
+            FAILED_VALIDATION_SCOPE,
+            ANY_METHOD,
+        )
     }
 
     #[tokio::test]
     async fn only_authentication_failures_are_counted() {
         // 401 and 403 say something about the client
-        assert_eq!(failures_counted(|| BarnacleError::invalid_api_key("nope")).await, 1);
+        assert_eq!(
+            failures_counted(|| BarnacleError::invalid_api_key("nope")).await,
+            1
+        );
         assert_eq!(
             failures_counted(|| BarnacleError::custom("forbidden", Some(StatusCode::FORBIDDEN)))
                 .await,
             1
         );
         // The validator's own backend failing does not lock the client out
-        assert_eq!(failures_counted(|| BarnacleError::store_error("db down")).await, 0);
-        assert_eq!(failures_counted(|| BarnacleError::internal_error("boom")).await, 0);
+        assert_eq!(
+            failures_counted(|| BarnacleError::store_error("db down")).await,
+            0
+        );
+        assert_eq!(
+            failures_counted(|| BarnacleError::internal_error("boom")).await,
+            0
+        );
     }
 
     #[tokio::test]
     async fn a_missing_validator_state_is_never_counted() {
         let store = MemoryStore::default();
         // A validator that needs state, built without one: Barnacle's own misconfiguration
-        let validator = |_key: String, _config: ApiKeyConfig, _parts: Arc<Parts>, _state: String| {
-            Box::pin(async move { Ok(()) }) as ValidationFuture
-        };
+        let validator =
+            |_key: String, _config: ApiKeyConfig, _parts: Arc<Parts>, _state: String| {
+                Box::pin(async move { Ok(()) }) as ValidationFuture
+            };
         let layer: BarnacleLayer<(), MemoryStore, String, BarnacleError, _> =
             BarnacleLayer::builder()
                 .with_store(store.clone())
@@ -632,12 +758,18 @@ mod api_keys {
                 .with_failed_validation_limit(limit(3))
                 .build()
                 .unwrap();
-        let app = Router::new().route("/", get(|| async { "ok" })).route_layer(layer);
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .route_layer(layer);
 
         let response = send(&app, keyed("some-key", "1.1.1.1:1")).await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
-            store.count(BarnacleKey::Ip("1.1.1.1".into()), FAILED_VALIDATION_SCOPE, ANY_METHOD),
+            store.count(
+                BarnacleKey::Ip("1.1.1.1".into()),
+                FAILED_VALIDATION_SCOPE,
+                ANY_METHOD
+            ),
             0
         );
     }
@@ -650,14 +782,27 @@ mod api_keys {
             .with_config(limit(2))
             .build()
             .unwrap();
-        let app = Router::new().route("/", get(|| async { "ok" })).route_layer(layer);
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .route_layer(layer);
 
         // A different made-up key per request must not give a fresh bucket
         let mut statuses = vec![];
         for attempt in 0..3 {
-            statuses.push(send(&app, keyed(&format!("random-{attempt}"), "1.1.1.1:1")).await.status());
+            statuses.push(
+                send(&app, keyed(&format!("random-{attempt}"), "1.1.1.1:1"))
+                    .await
+                    .status(),
+            );
         }
-        assert_eq!(statuses, [StatusCode::OK, StatusCode::OK, StatusCode::TOO_MANY_REQUESTS]);
+        assert_eq!(
+            statuses,
+            [
+                StatusCode::OK,
+                StatusCode::OK,
+                StatusCode::TOO_MANY_REQUESTS
+            ]
+        );
     }
 }
 
@@ -672,17 +817,25 @@ mod store_failures {
             .with_store_timeout(Duration::from_millis(50))
             .build()
             .unwrap();
-        Router::new().route("/", get(|| async { "ok" })).route_layer(layer)
+        Router::new()
+            .route("/", get(|| async { "ok" }))
+            .route_layer(layer)
     }
 
     fn plain() -> Request<Body> {
-        with_peer(request("GET", "/").body(Body::empty()).unwrap(), "1.1.1.1:1")
+        with_peer(
+            request("GET", "/").body(Body::empty()).unwrap(),
+            "1.1.1.1:1",
+        )
     }
 
     #[tokio::test]
     async fn fail_closed_rejects_when_the_store_is_down() {
         let app = app(BrokenStore { delay: None }, StoreFailurePolicy::FailClosed);
-        assert_eq!(send(&app, plain()).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            send(&app, plain()).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]
@@ -695,10 +848,15 @@ mod store_failures {
 
     #[tokio::test]
     async fn slow_stores_time_out() {
-        let slow = BrokenStore { delay: Some(Duration::from_secs(5)) };
+        let slow = BrokenStore {
+            delay: Some(Duration::from_secs(5)),
+        };
         let closed = app(slow.clone(), StoreFailurePolicy::FailClosed);
         let started = std::time::Instant::now();
-        assert_eq!(send(&closed, plain()).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            send(&closed, plain()).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         assert!(started.elapsed() < Duration::from_secs(1));
 
         let open = app(slow, StoreFailurePolicy::FailOpen);
@@ -716,11 +874,27 @@ mod responses {
             .with_config(limit(1))
             .build()
             .unwrap();
-        let app = Router::new().route("/", get(|| async { "ok" })).route_layer(layer);
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .route_layer(layer);
 
-        let first = send(&app, with_peer(request("GET", "/").body(Body::empty()).unwrap(), "1.1.1.1:1")).await;
+        let first = send(
+            &app,
+            with_peer(
+                request("GET", "/").body(Body::empty()).unwrap(),
+                "1.1.1.1:1",
+            ),
+        )
+        .await;
         assert_eq!(first.status(), StatusCode::OK);
-        let second = send(&app, with_peer(request("GET", "/").body(Body::empty()).unwrap(), "1.1.1.1:1")).await;
+        let second = send(
+            &app,
+            with_peer(
+                request("GET", "/").body(Body::empty()).unwrap(),
+                "1.1.1.1:1",
+            ),
+        )
+        .await;
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
         let headers = second.headers();
         assert_eq!(headers["retry-after"], "42");
@@ -771,7 +945,10 @@ mod payload {
         let response = send(&app, with_peer(req, "1.1.1.1:1")).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_text(response).await, body);
-        assert_eq!(store.count(BarnacleKey::Email("a@b.c".into()), "/login", "POST"), 1);
+        assert_eq!(
+            store.count(BarnacleKey::Email("a@b.c".into()), "/login", "POST"),
+            1
+        );
     }
 
     #[tokio::test]
@@ -780,13 +957,24 @@ mod payload {
         let body = format!(r#"{{"email":"{}"}}"#, "a".repeat(100));
 
         // Declared length over the limit
-        let req = request("POST", "/login").body(Body::from(body.clone())).unwrap();
-        assert_eq!(send(&app, with_peer(req, "1.1.1.1:1")).await.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let req = request("POST", "/login")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        assert_eq!(
+            send(&app, with_peer(req, "1.1.1.1:1")).await.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
 
         // Streamed body without a declared length
-        let stream = futures::stream::iter([Ok::<_, std::io::Error>(axum::body::Bytes::from(body))]);
-        let req = request("POST", "/login").body(Body::from_stream(stream)).unwrap();
-        assert_eq!(send(&app, with_peer(req, "1.1.1.1:1")).await.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let stream =
+            futures::stream::iter([Ok::<_, std::io::Error>(axum::body::Bytes::from(body))]);
+        let req = request("POST", "/login")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        assert_eq!(
+            send(&app, with_peer(req, "1.1.1.1:1")).await.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 
     #[tokio::test]
@@ -798,10 +986,15 @@ mod payload {
             .build()
             .unwrap();
         let app = Router::new()
-            .route("/upload", post(|body: String| async move { body.len().to_string() }))
+            .route(
+                "/upload",
+                post(|body: String| async move { body.len().to_string() }),
+            )
             .route_layer(layer);
         // The limit only applies to bodies Barnacle reads, this one goes straight to the handler
-        let req = request("POST", "/upload").body(Body::from("x".repeat(1000))).unwrap();
+        let req = request("POST", "/upload")
+            .body(Body::from("x".repeat(1000)))
+            .unwrap();
         let response = send(&app, with_peer(req, "1.1.1.1:1")).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_text(response).await, "1000");

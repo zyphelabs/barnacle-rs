@@ -358,7 +358,6 @@ impl IntoResponse for BarnacleError {
     }
 }
 
-
 /// Convert from various error types into BarnacleError
 impl From<serde_json::Error> for BarnacleError {
     fn from(err: serde_json::Error) -> Self {

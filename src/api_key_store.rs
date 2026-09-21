@@ -7,9 +7,9 @@ use deadpool_redis::{Connection, Pool};
 use std::sync::Arc;
 
 use crate::error::BarnacleError;
-use crate::types::{ApiKeyValidationResult, BarnacleConfig, StaticApiKeyConfig};
 #[cfg(feature = "redis")]
 use crate::types::{hash_api_key, redact_api_key};
+use crate::types::{ApiKeyValidationResult, BarnacleConfig, StaticApiKeyConfig};
 
 /// Trait for API key validation and configuration retrieval
 #[async_trait]
@@ -238,7 +238,10 @@ impl RedisApiKeyStore {
 
         match validator(api_key.to_string()).await {
             Ok(Some(key_id)) => {
-                tracing::debug!("API key validated successfully: {}", redact_api_key(api_key));
+                tracing::debug!(
+                    "API key validated successfully: {}",
+                    redact_api_key(api_key)
+                );
 
                 // Save to Redis for future use
                 let rate_limit_config = config

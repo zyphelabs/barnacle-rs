@@ -58,7 +58,14 @@ struct LayerOptions {
 }
 
 /// Builder for BarnacleLayer
-pub struct BarnacleLayerBuilder<T = (), S = RedisBarnacleStore, State = (), E = BarnacleError, V = (), M = ()> {
+pub struct BarnacleLayerBuilder<
+    T = (),
+    S = RedisBarnacleStore,
+    State = (),
+    E = BarnacleError,
+    V = (),
+    M = (),
+> {
     store: Option<S>,
     config: Option<BarnacleConfig>,
     state: Option<State>,
@@ -72,7 +79,7 @@ pub struct BarnacleLayerBuilder<T = (), S = RedisBarnacleStore, State = (), E = 
 impl<T, S, State, E, V, M> BarnacleLayerBuilder<T, S, State, E, V, M>
 where
     S: BarnacleStore + 'static,
-    State: Clone +Send + Sync + 'static,
+    State: Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
 {
@@ -157,7 +164,9 @@ where
     pub fn build(self) -> Result<BarnacleLayer<T, S, State, E, V, M>, BarnacleLayerBuilderError> {
         Ok(BarnacleLayer {
             store: self.store.ok_or(BarnacleLayerBuilderError::MissingStore)?,
-            config: self.config.ok_or(BarnacleLayerBuilderError::MissingConfig)?,
+            config: self
+                .config
+                .ok_or(BarnacleLayerBuilderError::MissingConfig)?,
             state: self.state,
             api_key_validator: self.api_key_validator,
             api_key_middleware_config: self.api_key_middleware_config,
@@ -169,7 +178,14 @@ where
 }
 
 /// Generic rate limiting and API key layer
-pub struct BarnacleLayer<T = (), S = RedisBarnacleStore, State = (), E = BarnacleError, V = (), M = ()> {
+pub struct BarnacleLayer<
+    T = (),
+    S = RedisBarnacleStore,
+    State = (),
+    E = BarnacleError,
+    V = (),
+    M = (),
+> {
     store: S,
     config: BarnacleConfig,
     state: Option<State>,
@@ -282,7 +298,10 @@ where
 
 /// Response for a failed store operation, or `None` when the failure policy lets
 /// the request through.
-fn store_error_response<E>(error: BarnacleError, policy: StoreFailurePolicy) -> Option<Response<Body>>
+fn store_error_response<E>(
+    error: BarnacleError,
+    policy: StoreFailurePolicy,
+) -> Option<Response<Body>>
 where
     E: IntoResponse + From<BarnacleError>,
 {
@@ -292,7 +311,10 @@ where
     match policy {
         StoreFailurePolicy::FailClosed => Some(E::from(error).into_response()),
         StoreFailurePolicy::FailOpen => {
-            warn!("Rate limit store unavailable, letting the request through: {}", error);
+            warn!(
+                "Rate limit store unavailable, letting the request through: {}",
+                error
+            );
             None
         }
     }
@@ -315,8 +337,7 @@ async fn handle_rate_limit_reset<S>(
     if !config.is_success_status(status_code) {
         debug!(
             "Not resetting rate limit for key {:?} due to error status: {}",
-            context.key,
-            status_code
+            context.key, status_code
         );
         return;
     }
@@ -334,15 +355,11 @@ async fn handle_rate_limit_reset<S>(
         match call_store(store_timeout, store.reset(ctx)).await {
             Ok(_) => debug!(
                 "Rate limit reset for key {:?} after successful request (status: {}) path: {}",
-                ctx.key,
-                status_code,
-                ctx.path
+                ctx.key, status_code, ctx.path
             ),
             Err(e) => warn!(
                 "Failed to reset rate limit for key {:?}: {} path: {}",
-                ctx.key,
-                e,
-                ctx.path
+                ctx.key, e, ctx.path
             ),
         }
     }
@@ -645,7 +662,8 @@ where
     Ok(collected.to_bytes())
 }
 
-impl<Inner, B, T, S, State, E, V, M> Service<Request<B>> for BarnacleMiddleware<Inner, T, S, State, E, V, M>
+impl<Inner, B, T, S, State, E, V, M> Service<Request<B>>
+    for BarnacleMiddleware<Inner, T, S, State, E, V, M>
 where
     Inner: Service<Request<axum::body::Body>, Response = Response<Body>> + Clone + Send + 'static,
     Inner::Future: Send + 'static,
@@ -681,9 +699,9 @@ where
         Box::pin(async move {
             let (mut parts, body) = req.into_parts();
             let current_path = request_path(&parts).to_owned();
-            parts
-                .extensions
-                .insert(ClientIpStrategyExtension(options.client_ip_strategy.clone()));
+            parts.extensions.insert(ClientIpStrategyExtension(
+                options.client_ip_strategy.clone(),
+            ));
 
             // API key validation (if configured)
             let api_key_config = api_key_config.unwrap_or_default();
@@ -700,7 +718,11 @@ where
             // clients, so the limit is skipped instead of locking all of them out.
             let failed_validation = match (&api_key_validator, &options.failed_validation_limit) {
                 (Some(_), Some(limit)) if !api_key.is_empty() => {
-                    match resolve_client_ip(&parts.extensions, &parts.headers, &options.client_ip_strategy) {
+                    match resolve_client_ip(
+                        &parts.extensions,
+                        &parts.headers,
+                        &options.client_ip_strategy,
+                    ) {
                         Some(ip) => Some((
                             BarnacleContext::named(BarnacleKey::Ip(ip), FAILED_VALIDATION_SCOPE),
                             limit,
@@ -720,9 +742,15 @@ where
             // client from costing a key lookup per attempt: it can't be merged with the
             // increment below, which only happens after the validator answered.
             if let Some((context, limit)) = &failed_validation {
-                if let Err(e) = call_store(options.store_timeout, store.peek(context, limit)).await {
-                    if let Some(response) = store_error_response::<E>(e, options.store_failure_policy) {
-                        debug!("Rejecting key {:?}: too many failed API key validations", context.key);
+                if let Err(e) = call_store(options.store_timeout, store.peek(context, limit)).await
+                {
+                    if let Some(response) =
+                        store_error_response::<E>(e, options.store_failure_policy)
+                    {
+                        debug!(
+                            "Rejecting key {:?}: too many failed API key validations",
+                            context.key
+                        );
                         return Ok(response);
                     }
                 }
@@ -735,11 +763,25 @@ where
                 let is_unit_state = TypeId::of::<State>() == TypeId::of::<()>();
                 if is_stateless_validator && is_unit_state {
                     // Both validator and state are (), safe to call with zeroed State
-                    validator.call(api_key.clone(), api_key_config, Arc::new(parts.clone()), unsafe { std::mem::zeroed() }).await
+                    validator
+                        .call(
+                            api_key.clone(),
+                            api_key_config,
+                            Arc::new(parts.clone()),
+                            unsafe { std::mem::zeroed() },
+                        )
+                        .await
                 } else {
                     match validator_state {
                         Some(validator_state) => {
-                            validator.call(api_key.clone(), api_key_config, Arc::new(parts.clone()), validator_state).await
+                            validator
+                                .call(
+                                    api_key.clone(),
+                                    api_key_config,
+                                    Arc::new(parts.clone()),
+                                    validator_state,
+                                )
+                                .await
                         }
                         None => {
                             // Return a more appropriate error for missing validator state
@@ -753,7 +795,10 @@ where
             };
             if let Err(e) = validation_result {
                 let response = e.into_response();
-                debug!("API key validation failed with status {}", response.status());
+                debug!(
+                    "API key validation failed with status {}",
+                    response.status()
+                );
                 // Only an authentication failure says anything about the client: a
                 // validator that answers 500 or 503 because its own backend blipped
                 // must not lock legitimate clients out for the whole window.
@@ -762,8 +807,10 @@ where
                         response.status(),
                         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
                     );
-                if let Some((context, limit)) = failed_validation.filter(|_| authentication_failed) {
-                    match call_store(options.store_timeout, store.increment(&context, limit)).await {
+                if let Some((context, limit)) = failed_validation.filter(|_| authentication_failed)
+                {
+                    match call_store(options.store_timeout, store.increment(&context, limit)).await
+                    {
                         Ok(_) => {}
                         // Another request reached the limit in the meantime
                         Err(limit_error @ BarnacleError::RateLimitExceeded { .. }) => {
@@ -790,7 +837,10 @@ where
                 if let Some(modifier_state) = modifier_state {
                     modifier.modify(parts, modifier_state).await
                 } else {
-                    Err(E::from(BarnacleError::custom("Barnacle: Request modifier requires state, but none was provided.", None)))
+                    Err(E::from(BarnacleError::custom(
+                        "Barnacle: Request modifier requires state, but none was provided.",
+                        None,
+                    )))
                 }
             } else {
                 Ok(parts)
@@ -804,9 +854,9 @@ where
             };
             // A modifier that rebuilds the parts may have dropped the extension the
             // public `client_ip` helpers read, in the key extractor or in the handler
-            parts
-                .extensions
-                .insert(ClientIpStrategyExtension(options.client_ip_strategy.clone()));
+            parts.extensions.insert(ClientIpStrategyExtension(
+                options.client_ip_strategy.clone(),
+            ));
 
             // The body is only buffered when the key has to be read from the payload
             let reads_payload = api_key_used.is_none() && TypeId::of::<T>() != TypeId::of::<()>();
@@ -831,7 +881,9 @@ where
                         .and_then(|value| value.to_str().ok())
                         .and_then(|value| value.parse::<usize>().ok());
                     if content_length.is_some_and(|length| length > limit) {
-                        return Ok(E::from(BarnacleError::PayloadTooLarge { limit }).into_response());
+                        return Ok(
+                            E::from(BarnacleError::PayloadTooLarge { limit }).into_response()
+                        );
                     }
                 }
                 let bytes = match collect_body(body, options.max_body_size).await {
@@ -872,10 +924,18 @@ where
                 RateLimitScope::Named(name) => BarnacleContext::named(key, name.clone()),
             };
 
-            let result = match call_store(options.store_timeout, store.increment(&rate_limit_context, &config)).await {
+            let result = match call_store(
+                options.store_timeout,
+                store.increment(&rate_limit_context, &config),
+            )
+            .await
+            {
                 Ok(result) => Some(result),
                 Err(e) => {
-                    debug!("Rate limit not passed for context {:?}: {}", rate_limit_context, e);
+                    debug!(
+                        "Rate limit not passed for context {:?}: {}",
+                        rate_limit_context, e
+                    );
                     match store_error_response::<E>(e, options.store_failure_policy) {
                         Some(response) => return Ok(response),
                         None => None,

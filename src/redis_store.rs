@@ -278,7 +278,10 @@ impl BarnacleStore for RedisBarnacleStore {
             .query_async(&mut conn)
             .await
             .map_err(|e| {
-                BarnacleError::store_error_with_source("Failed to delete key from Redis", Box::new(e))
+                BarnacleError::store_error_with_source(
+                    "Failed to delete key from Redis",
+                    Box::new(e),
+                )
             })?;
 
         Ok(())

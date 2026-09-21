@@ -1,13 +1,13 @@
+use axum::http::request::Parts;
 use axum::{response::Json, routing::get, Router};
 use barnacle_rs::{
-    ApiKeyConfig, ApiKeyStore, ApiKeyValidationResult, BarnacleConfig, BarnacleError, BarnacleLayer,
-    RedisBarnacleStore,
+    ApiKeyConfig, ApiKeyStore, ApiKeyValidationResult, BarnacleConfig, BarnacleError,
+    BarnacleLayer, RedisBarnacleStore,
 };
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceBuilder;
-use std::sync::Arc;
-use axum::http::request::Parts;
 
 /// Example custom API key store that validates against a "database"
 /// (in this case, just hardcoded keys for demonstration)
@@ -94,7 +94,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(postgres_store.clone());
     // Default rate limit if not specified by store
     let config = BarnacleConfig::new(5, Duration::from_secs(60));
-    let api_key_validator = |api_key: String, _api_key_config: ApiKeyConfig, _parts: Arc<Parts>, state: Arc<PostgresApiKeyStore>| async move {
+    let api_key_validator = |api_key: String,
+                             _api_key_config: ApiKeyConfig,
+                             _parts: Arc<Parts>,
+                             state: Arc<PostgresApiKeyStore>| async move {
         // `?` propagates a store failure as a 5xx, so a database blip is not answered
         // with 401 and not counted against the client
         if state.validate_key(&api_key).await?.valid {
@@ -108,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Add a custom header to show the request was modified
         parts.headers.insert(
             "x-modified-by",
-            "barnacle-request-modifier".parse().unwrap()
+            "barnacle-request-modifier".parse().unwrap(),
         );
         Ok(parts)
     };

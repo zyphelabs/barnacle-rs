@@ -118,6 +118,3 @@ pub trait BarnacleStore: Clone + Send + Sync {
         ))
     }
 }
-
-
-
