@@ -1,8 +1,8 @@
----
-default: major
----
+## 0.4.0 (2026-09-22)
 
-Harden rate limiting against key spoofing, stuck counters, and Redis outages.
+### Breaking Changes
+
+#### Harden rate limiting against key spoofing, stuck counters, and Redis outages.
 
 Hash API keys in Redis keys and move 0.3 entries on first lookup. Count requests with a
 single atomic Lua script and repair counters left without expiry. Apply pool timeouts to
