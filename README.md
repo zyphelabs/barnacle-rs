@@ -544,3 +544,7 @@ MIT
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+Changes to the published code need a changeset: run `knope document-change` or see
+[docs/changesets.md](docs/changesets.md). Releases are prepared and published by CI, see
+[docs/releases.md](docs/releases.md).
