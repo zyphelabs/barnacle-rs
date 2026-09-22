@@ -14,7 +14,10 @@ async fn main() {
         window: std::time::Duration::from_secs(6),
         ..Default::default()
     };
-    let api_key_validator = |api_key: String, _api_key_config: ApiKeyConfig, _parts: Arc<Parts>, _state: ()| async move {
+    let api_key_validator = |api_key: String,
+                             _api_key_config: ApiKeyConfig,
+                             _parts: Arc<Parts>,
+                             _state: ()| async move {
         if api_key != "valid-key-123" {
             Err(BarnacleError::invalid_api_key(api_key))
         } else {

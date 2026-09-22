@@ -55,22 +55,25 @@ mod types;
 pub use api_key_store::{ApiKeyStore, StaticApiKeyStore};
 pub use error::BarnacleError;
 pub use middleware::{
-    BarnacleLayer, KeyExtractable, BarnacleLayerBuilderError, RequestModifier
+    client_ip, client_ip_key, BarnacleLayer, BarnacleLayerBuilderError, KeyExtractable,
+    RequestModifier, FAILED_VALIDATION_SCOPE,
 };
 pub use tracing;
 pub use types::{
-    BarnacleConfig, BarnacleContext, BarnacleKey, BarnacleResult,
-    ResetOnSuccess, StaticApiKeyConfig, ApiKeyConfig,
+    hash_api_key, redact_api_key, ApiKeyConfig, ApiKeyValidationResult, BarnacleConfig,
+    BarnacleContext, BarnacleKey, BarnacleResult, ClientIpStrategy, RateLimitScope, ResetOnSuccess,
+    StaticApiKeyConfig, StoreFailurePolicy, ANY_METHOD,
 };
 
 // Redis-specific exports (only available with "redis" feature)
 #[cfg(feature = "redis")]
 pub use api_key_store::RedisApiKeyStore;
 #[cfg(feature = "redis")]
-pub use redis_store::RedisBarnacleStore;
+pub use redis_store::{RedisBarnacleStore, RedisPoolOptions};
 // Re-export commonly used external dependencies (only with redis feature)
 #[cfg(feature = "redis")]
 pub use deadpool_redis;
+pub use ipnet;
 
 use async_trait::async_trait;
 
@@ -90,7 +93,28 @@ pub trait BarnacleStore: Clone + Send + Sync {
     ) -> Result<types::BarnacleResult, BarnacleError>;
     /// Resets the counter for the key (e.g., after successful login).
     async fn reset(&self, context: &BarnacleContext) -> Result<(), BarnacleError>;
+
+    /// Reads the counter for the key without incrementing it.
+    ///
+    /// Returns `Err(BarnacleError::RateLimitExceeded)` when the limit is already reached.
+    /// Used to reject clients that exceeded the failed API key validation limit before
+    /// running the validator again. The default implementation returns a store error,
+    /// so a store without `peek` is handled by the layer's [`StoreFailurePolicy`]
+    /// (rejected with the default `FailClosed`) instead of silently skipping the limit.
+    ///
+    /// It cannot be merged with the [`BarnacleStore::increment`] of the request: the
+    /// validator runs in between (that is the point of reading the counter first), and
+    /// the increment that follows targets a different bucket with a different config.
+    /// A request carrying an API key therefore costs one round trip here and one there
+    /// when a failed validation limit is configured.
+    async fn peek(
+        &self,
+        context: &BarnacleContext,
+        config: &BarnacleConfig,
+    ) -> Result<types::BarnacleResult, BarnacleError> {
+        let _ = (context, config);
+        Err(BarnacleError::store_error(
+            "This store does not implement `peek`, required by the failed validation limit",
+        ))
+    }
 }
-
-
-

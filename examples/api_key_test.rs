@@ -6,10 +6,10 @@ use axum::{
     routing::post,
     Router,
 };
-use serde::{Deserialize, Serialize};
-use barnacle_rs::{ApiKeyConfig, BarnacleConfig, BarnacleLayer, RedisBarnacleStore};
-use std::sync::Arc;
 use barnacle_rs::BarnacleError;
+use barnacle_rs::{ApiKeyConfig, BarnacleConfig, BarnacleLayer, RedisBarnacleStore};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Serialize, Deserialize)]
 struct TestResponse {
@@ -29,13 +29,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = RedisBarnacleStore::from_url(&redis_url)
         .map_err(|e| format!("Failed to create Redis store: {}", e))?;
 
-    let config = BarnacleConfig {
-        max_requests: 3,
-        window: Duration::from_secs(60),
-        reset_on_success: barnacle_rs::ResetOnSuccess::Not,
-    };
+    let config = BarnacleConfig::new(3, Duration::from_secs(60));
 
-    let api_key_validator = |api_key: String, _api_key_config: ApiKeyConfig, _parts: Arc<Parts>, _state: ()| async move {
+    let api_key_validator = |api_key: String,
+                             _api_key_config: ApiKeyConfig,
+                             _parts: Arc<Parts>,
+                             _state: ()| async move {
         if api_key.is_empty() {
             Err(BarnacleError::ApiKeyMissing)
         } else if api_key != "test_key_123" {

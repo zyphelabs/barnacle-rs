@@ -1,13 +1,13 @@
 use std::{sync::Arc, time::Duration};
 
+use axum::http::request::Parts;
 use axum::{http::StatusCode, response::Json, routing::get, Router};
+use barnacle_rs::BarnacleError;
+use barnacle_rs::{ApiKeyConfig, BarnacleLayer, RedisBarnacleStore};
 use deadpool_redis::Config as RedisConfig;
 use serde_json::json;
-use barnacle_rs::{BarnacleLayer, RedisBarnacleStore, ApiKeyConfig};
 use std::sync::Once;
 use uuid::Uuid;
-use barnacle_rs::BarnacleError;
-use axum::http::request::Parts;
 
 static INIT: Once = Once::new();
 
@@ -105,7 +105,10 @@ async fn create_test_app(path: &str) -> Router {
     }
 
     let rate_limit_store = RedisBarnacleStore::new(pool);
-    let api_key_validator = |api_key: String, _api_key_config: ApiKeyConfig, _parts: Arc<Parts>, _state: ()| async move {
+    let api_key_validator = |api_key: String,
+                             _api_key_config: ApiKeyConfig,
+                             _parts: Arc<Parts>,
+                             _state: ()| async move {
         if api_key.is_empty() {
             Err(BarnacleError::ApiKeyMissing)
         } else if api_key != VALID_KEY && api_key != VALID_KEY_2 {
@@ -114,17 +117,18 @@ async fn create_test_app(path: &str) -> Router {
             Ok(())
         }
     };
-    let middleware: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _> = BarnacleLayer::builder()
-        .with_store(rate_limit_store)
-        .with_config(barnacle_rs::BarnacleConfig {
-            max_requests: RATE_LIMIT_VALID,
-            window: Duration::from_secs(WINDOW_SECONDS),
-            ..Default::default()
-        })
-        .with_api_key_validator(api_key_validator)
-        .with_state(())
-        .build()
-        .unwrap();
+    let middleware: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _> =
+        BarnacleLayer::builder()
+            .with_store(rate_limit_store)
+            .with_config(barnacle_rs::BarnacleConfig {
+                max_requests: RATE_LIMIT_VALID,
+                window: Duration::from_secs(WINDOW_SECONDS),
+                ..Default::default()
+            })
+            .with_api_key_validator(api_key_validator)
+            .with_state(())
+            .build()
+            .unwrap();
 
     // Test endpoint
     Router::new()
@@ -177,7 +181,9 @@ async fn make_request(url: &str, api_key: Option<&str>) -> (StatusCode, String) 
 
 async fn print_redis_keys() {
     let redis_cfg = RedisConfig::from_url("redis://127.0.0.1/");
-    let pool = redis_cfg.create_pool(None).expect("Failed to create Redis pool");
+    let pool = redis_cfg
+        .create_pool(None)
+        .expect("Failed to create Redis pool");
     let mut conn = pool.get().await.expect("Failed to get Redis connection");
     let _keys: Vec<String> = deadpool_redis::redis::cmd("KEYS")
         .arg("barnacle:*")
@@ -228,10 +234,19 @@ mod api_keys {
         let url = format!("{}{}", base_url, unique_path);
 
         let client = reqwest::Client::new();
-        let _resp1 = client.get(&url).header("x-api-key", VALID_KEY).send().await.unwrap();
+        let _resp1 = client
+            .get(&url)
+            .header("x-api-key", VALID_KEY)
+            .send()
+            .await
+            .unwrap();
 
-        let _resp2 = client.get(&url).header("x-api-key", VALID_KEY).send().await.unwrap();
-
+        let _resp2 = client
+            .get(&url)
+            .header("x-api-key", VALID_KEY)
+            .send()
+            .await
+            .unwrap();
 
         for i in 1..=RATE_LIMIT_VALID {
             let (status, _body) = make_request(&url, Some(VALID_KEY_2)).await;
@@ -273,14 +288,17 @@ mod api_keys {
     #[tokio::test]
     async fn test_redis_connection_failure() {
         init_tracing();
-        // Invalid redis url
-        let redis_cfg = RedisConfig::from_url("redis://invalid-host:6379/");
+        // Unreachable redis (a hostname could still resolve, e.g. with ISP DNS wildcards)
+        let redis_cfg = RedisConfig::from_url("redis://127.0.0.1:1/");
         let pool = redis_cfg
             .create_pool(None)
             .expect("Failed to create Redis pool");
 
         let rate_limit_store = RedisBarnacleStore::new(pool);
-        let api_key_validator = |api_key: String, _api_key_config: ApiKeyConfig, _parts: Arc<Parts>, _state: ()| async move {
+        let api_key_validator = |api_key: String,
+                                 _api_key_config: ApiKeyConfig,
+                                 _parts: Arc<Parts>,
+                                 _state: ()| async move {
             if api_key.is_empty() {
                 Err(BarnacleError::ApiKeyMissing)
             } else if api_key != VALID_KEY && api_key != VALID_KEY_2 {
@@ -289,17 +307,18 @@ mod api_keys {
                 Ok(())
             }
         };
-        let middleware: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _> = BarnacleLayer::builder()
-            .with_store(rate_limit_store)
-            .with_config(barnacle_rs::BarnacleConfig {
-                max_requests: RATE_LIMIT_VALID,
-                window: Duration::from_secs(WINDOW_SECONDS),
-                ..Default::default()
-            })
-            .with_api_key_validator(api_key_validator)
-            .with_state(())
-            .build()
-            .unwrap();
+        let middleware: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _> =
+            BarnacleLayer::builder()
+                .with_store(rate_limit_store)
+                .with_config(barnacle_rs::BarnacleConfig {
+                    max_requests: RATE_LIMIT_VALID,
+                    window: Duration::from_secs(WINDOW_SECONDS),
+                    ..Default::default()
+                })
+                .with_api_key_validator(api_key_validator)
+                .with_state(())
+                .build()
+                .unwrap();
 
         let app = Router::new()
             .route("/test", get(test_handler))

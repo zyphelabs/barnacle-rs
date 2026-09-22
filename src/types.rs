@@ -4,6 +4,10 @@ use std::time::Duration;
 /// Special constant to indicate a placeholder key that should be replaced
 pub const NO_KEY: &str = "__BARNACLE_NO_KEY_PLACEHOLDER__";
 
+/// Method recorded in contexts that are not tied to a single route and method,
+/// i.e. the buckets built by [`BarnacleContext::named`].
+pub const ANY_METHOD: &str = "*";
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ResetOnSuccess {
     Not,
@@ -30,6 +34,15 @@ impl Default for BarnacleConfig {
 }
 
 impl BarnacleConfig {
+    /// Allow `max_requests` per `window`, without resetting on success.
+    pub fn new(max_requests: u32, window: Duration) -> Self {
+        Self {
+            max_requests,
+            window,
+            reset_on_success: ResetOnSuccess::Not,
+        }
+    }
+
     /// Check if a status code should be considered successful for rate limit reset
     pub fn is_success_status(&self, status_code: u16) -> bool {
         match &self.reset_on_success {
@@ -47,12 +60,110 @@ impl BarnacleConfig {
 }
 
 /// Identification key for rate limiting (e.g., email, api-key, IP)
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+///
+/// The `Debug` output of [`BarnacleKey::ApiKey`] is redacted so that API keys
+/// never end up in logs in clear text.
+#[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BarnacleKey {
     Email(String),
     ApiKey(String),
     Ip(String),
     Custom(String),
+}
+
+impl std::fmt::Debug for BarnacleKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BarnacleKey::Email(email) => f.debug_tuple("Email").field(email).finish(),
+            BarnacleKey::ApiKey(api_key) => f
+                .debug_tuple("ApiKey")
+                .field(&redact_api_key(api_key))
+                .finish(),
+            BarnacleKey::Ip(ip) => f.debug_tuple("Ip").field(ip).finish(),
+            BarnacleKey::Custom(custom) => f.debug_tuple("Custom").field(custom).finish(),
+        }
+    }
+}
+
+/// SHA-256 hex digest of an API key.
+///
+/// Used to build store keys, so that API keys are never persisted in clear text.
+pub fn hash_api_key(api_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(api_key.as_bytes()))
+}
+
+/// Log-safe representation of an API key: a short prefix of its hash.
+pub fn redact_api_key(api_key: &str) -> String {
+    format!("sha256:{}", &hash_api_key(api_key)[..12])
+}
+
+/// Which part of the request identifies the rate limit bucket, besides the key.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RateLimitScope {
+    /// One bucket per concrete request path and method (`/users/42` and `/users/43`
+    /// are counted separately). This is the pre-0.4 behaviour.
+    #[default]
+    Path,
+    /// One bucket per route template and method (`/users/{id}`), read from axum's
+    /// `MatchedPath`. Falls back to the concrete path when no route matched.
+    Route,
+    /// One bucket per key shared by every route and method the layer wraps.
+    /// Layers configured with the same name share the same bucket.
+    Named(String),
+}
+
+/// What to do when the store (e.g. Redis) fails or times out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StoreFailurePolicy {
+    /// Reject the request with the store error (503). This is the pre-0.4 behaviour.
+    #[default]
+    FailClosed,
+    /// Let the request through without rate limiting and log a warning.
+    FailOpen,
+}
+
+/// How the client IP is resolved for IP-based keys.
+#[derive(Clone, Debug, Default)]
+pub enum ClientIpStrategy {
+    /// Socket peer address (`ConnectInfo`), then the first `X-Forwarded-For` entry,
+    /// then `X-Real-IP`. This is the pre-0.4 behaviour: behind a load balancer every
+    /// client shares the balancer's IP, and without `ConnectInfo` the headers can be
+    /// spoofed by the client.
+    #[default]
+    Legacy,
+    /// Only the socket peer address (`ConnectInfo`). Use when not behind a proxy.
+    PeerOnly,
+    /// The application runs behind the given proxies (e.g. the load balancer subnets).
+    ///
+    /// If the peer address is not a trusted proxy it is the client. Otherwise
+    /// `X-Forwarded-For` is walked right to left and the first address that is not a
+    /// trusted proxy is the client, so entries forged by the client are ignored.
+    TrustedProxies(Vec<ipnet::IpNet>),
+}
+
+impl ClientIpStrategy {
+    /// Build a [`ClientIpStrategy::TrustedProxies`] from CIDR strings
+    /// (e.g. `"10.0.0.0/8"`); bare addresses are treated as single hosts.
+    pub fn trusted_proxies<I, S>(proxies: I) -> Result<Self, ipnet::AddrParseError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        proxies
+            .into_iter()
+            .map(|proxy| {
+                let proxy = proxy.as_ref().trim();
+                proxy.parse::<ipnet::IpNet>().or_else(|err| {
+                    proxy
+                        .parse::<std::net::IpAddr>()
+                        .map(ipnet::IpNet::from)
+                        .map_err(|_| err)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(ClientIpStrategy::TrustedProxies)
+    }
 }
 
 /// Rate limiting context that includes route information
@@ -72,6 +183,21 @@ impl BarnacleContext {
             key: BarnacleKey::Custom(NO_KEY.to_string()),
             path: path.into(),
             method: method.into(),
+        }
+    }
+
+    /// Context of a bucket that is not tied to a single route and method: the one
+    /// counted by a [`RateLimitScope::Named`] layer, or the failed validation bucket
+    /// (`barnacle_rs::FAILED_VALIDATION_SCOPE`).
+    ///
+    /// Build the context this way to reset such a bucket, either through
+    /// [`ResetOnSuccess::Multiple`] or with a direct `store.reset` call; `name` is the
+    /// scope name and the method is always [`ANY_METHOD`].
+    pub fn named(key: BarnacleKey, name: impl Into<String>) -> Self {
+        Self {
+            key,
+            path: name.into(),
+            method: ANY_METHOD.to_string(),
         }
     }
 }
@@ -131,10 +257,7 @@ impl ApiKeyConfig {
         Default::default()
     }
 
-    pub fn custom(
-        header_name: String,
-        cache_ttl_seconds: u64,
-    ) -> Self {
+    pub fn custom(header_name: String, cache_ttl_seconds: u64) -> Self {
         Self {
             header_name,
             cache_ttl_seconds, // 1 hour default
