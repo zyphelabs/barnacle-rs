@@ -8,8 +8,8 @@ use axum::{
     Router,
 };
 use barnacle_rs::{
-    BarnacleConfig, BarnacleContext, BarnacleError, BarnacleKey, BarnacleLayer, BarnacleStore,
-    KeyExtractable, RedisBarnacleStore, ResetOnSuccess,
+    BarnacleConfig, BarnacleContext, BarnacleKey, BarnacleLayer, BarnacleStore, KeyExtractable,
+    RedisBarnacleStore, ResetOnSuccess,
 };
 use serde::{Deserialize, Serialize};
 
@@ -65,19 +65,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create different middleware layers for different endpoints
-    let login_layer: BarnacleLayer<LoginRequest, _, (), BarnacleError, ()> =
-        BarnacleLayer::builder()
-            .with_store(store.clone())
-            .with_config(login_config.clone())
-            .build()
-            .unwrap();
+    let login_layer: BarnacleLayer<_> = BarnacleLayer::builder()
+        .with_store(store.clone())
+        .with_config(login_config.clone())
+        .with_payload_key::<LoginRequest>()
+        .build()
+        .unwrap();
 
-    let strict_layer: BarnacleLayer<(), _, (), BarnacleError, ()> = BarnacleLayer::builder()
+    let strict_layer: BarnacleLayer<_> = BarnacleLayer::builder()
         .with_store(store.clone())
         .with_config(strict_config)
         .build()
         .unwrap();
-    let moderate_layer: BarnacleLayer<(), _, (), BarnacleError, ()> = BarnacleLayer::builder()
+    let moderate_layer: BarnacleLayer<_> = BarnacleLayer::builder()
         .with_store(store.clone())
         .with_config(moderate_config)
         .build()

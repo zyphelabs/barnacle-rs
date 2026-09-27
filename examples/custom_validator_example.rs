@@ -113,10 +113,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "x-modified-by",
             "barnacle-request-modifier".parse().unwrap(),
         );
-        Ok(parts)
+        Ok::<_, BarnacleError>(parts)
     };
 
-    let auth_layer: BarnacleLayer<(), _, _, _, _, _> = BarnacleLayer::builder()
+    let auth_layer: BarnacleLayer<_, _> = BarnacleLayer::builder()
         .with_store(store)
         .with_config(config)
         .with_state(state.clone())

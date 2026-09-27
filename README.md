@@ -26,6 +26,9 @@ Rate limiting and API key validation middleware for Axum with Redis backend.
 - **Configurable buckets**: Per path, per route template, or shared across routes
 - **Proxy-aware client IPs**: Trusted proxy list for applications behind a load balancer
 - **Brute-force protection**: Failed API key validations limited per client IP
+- **Principal identification**: Count requests per authenticated principal, with limits per tier
+- **Multiple atomic limits**: Burst and sustained, global and per route, all or nothing
+- **Shadow mode**: Measure limits (hook and logs) before enforcing them
 
 ## Examples
 
@@ -33,7 +36,7 @@ Rate limiting and API key validation middleware for Axum with Redis backend.
 
 ```toml
 [dependencies]
-barnacle-rs = "0.4"
+barnacle-rs = "0.5"
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 ```
@@ -46,13 +49,13 @@ use axum::{Router, routing::get};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = RedisBarnacleStore::from_url("redis://127.0.0.1:6379").await?;
+    let store = RedisBarnacleStore::from_url("redis://127.0.0.1:6379")?;
     // 10 requests per minute, without resetting on success
     let config = BarnacleConfig::new(10, std::time::Duration::from_secs(60));
-    let layer = barnacle_rs::BarnacleLayer::builder()
+    let layer: barnacle_rs::BarnacleLayer<RedisBarnacleStore> = barnacle_rs::BarnacleLayer::builder()
         .with_store(store)
         .with_config(config)
-        .build();
+        .build()?;
     let app = Router::new()
         .route("/api/data", get(handler))
         .layer(layer);
@@ -69,14 +72,14 @@ async fn handler() -> &'static str {
 ### API Key Validation (Stateless)
 
 ```rust
-use barnacle_rs::{BarnacleLayer, BarnacleConfig, RedisBarnacleStore, BarnacleError};
+use barnacle_rs::{ApiKeyConfig, BarnacleLayer, BarnacleConfig, RedisBarnacleStore, BarnacleError};
 use axum::{Router, routing::get};
 use std::sync::Arc;
 use axum::http::request::Parts;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = RedisBarnacleStore::from_url("redis://127.0.0.1:6379").await?;
+    let store = RedisBarnacleStore::from_url("redis://127.0.0.1:6379")?;
     let config = BarnacleConfig::default();
     let api_key_validator = |api_key: String, _api_key_config: ApiKeyConfig, _parts: Arc<Parts>, _state: ()| async move {
         if api_key.is_empty() {
@@ -87,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
     };
-    let layer: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _> = BarnacleLayer::builder()
+    let layer: BarnacleLayer<RedisBarnacleStore> = BarnacleLayer::builder()
         .with_store(store)
         .with_config(config)
         .with_api_key_validator(api_key_validator)
@@ -109,7 +112,7 @@ async fn handler() -> &'static str {
 ### API Key Validation (With state)
 
 ```rust
-use barnacle_rs::{BarnacleLayer, BarnacleConfig, RedisBarnacleStore, BarnacleError};
+use barnacle_rs::{ApiKeyConfig, BarnacleLayer, BarnacleConfig, RedisBarnacleStore, BarnacleError};
 use axum::{Router, routing::get};
 use std::sync::Arc;
 use axum::http::request::Parts;
@@ -121,10 +124,10 @@ struct MyState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = RedisBarnacleStore::from_url("redis://127.0.0.1:6379").await?;
+    let store = RedisBarnacleStore::from_url("redis://127.0.0.1:6379")?;
     let config = BarnacleConfig::default();
     let state = MyState { allowed_keys: vec!["my-secret-key".to_string()] };
-    let api_key_validator = |api_key: String, _api_key_config: BarnacleConfig, _parts: Arc<Parts>, state: MyState| async move {
+    let api_key_validator = |api_key: String, _api_key_config: ApiKeyConfig, _parts: Arc<Parts>, state: MyState| async move {
         let allowed = state.allowed_keys.contains(&api_key);
         if allowed {
             Ok(())
@@ -132,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(BarnacleError::invalid_api_key(api_key))
         }
     };
-    let layer: BarnacleLayer<(), RedisBarnacleStore, MyState, BarnacleError, _> = BarnacleLayer::builder()
+    let layer: BarnacleLayer<RedisBarnacleStore, MyState> = BarnacleLayer::builder()
         .with_store(store)
         .with_config(config)
         .with_state(state)
@@ -155,7 +158,7 @@ async fn handler() -> &'static str {
 ### Custom Key Extraction (e.g., Email)
 
 ```rust
-use barnacle_rs::{KeyExtractable, BarnacleKey};
+use barnacle_rs::{BarnacleKey, BarnacleLayer, KeyExtractable, RedisBarnacleStore};
 use axum::http::request::Parts;
 
 #[derive(serde::Deserialize)]
@@ -163,77 +166,33 @@ struct LoginRequest {
     email: String,
     password: String,
 }
+
 impl KeyExtractable for LoginRequest {
-    fn extract_key(&self) -> BarnacleKey {
+    fn extract_key(&self, _parts: &Parts) -> BarnacleKey {
         BarnacleKey::Email(self.email.clone())
     }
 }
-let layer = barnacle_rs::BarnacleLayer::builder()
+
+let layer: BarnacleLayer<RedisBarnacleStore> = BarnacleLayer::builder()
     .with_store(store)
     .with_config(config)
-    .build();
+    // Read the key from the JSON body; falls back to the client IP when it doesn't parse
+    .with_payload_key::<LoginRequest>()
+    .build()?;
 ```
 
-### Rate Limiting Strategies
+### Which key a request is counted for
 
-#### IP-based (default)
-
-```rust
-let layer = barnacle_rs::BarnacleLayer::builder()
-    .with_store(store)
-    .with_config(config)
-    .build();
-```
-
-#### API Key-based
-
-```rust
-let layer = barnacle_rs::BarnacleLayer::builder()
-    .with_store(api_key_store)
-    .with_config(config)
-    .build();
-```
-
-#### Custom Key (e.g., email)
-
-```rust
-use barnacle_rs::{KeyExtractable, BarnacleKey};
-
-#[derive(serde::Deserialize)]
-struct LoginRequest {
-    email: String,
-    password: String,
-}
-
-impl KeyExtractable for LoginRequest {
-    fn extract_key(&self) -> BarnacleKey {
-        BarnacleKey::Email(self.email.clone())
-    }
-
-}
-
-let layer = barnacle_rs::BarnacleLayer::builder()
-    .with_store(store)
-    .with_config(config)
-    .build();
-```
-
-### Example: No Validator (API key validation disabled)
-
-```rust
-use barnacle_rs::{BarnacleLayer, RedisBarnacleStore, BarnacleError};
-
-let middleware: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, ()> = BarnacleLayer::builder()
-    .with_store(store)
-    .with_config(config)
-    .build()
-    .unwrap();
-```
+1. The identity returned by the identifier, when one is configured and resolves the request
+   (see [Identifying requests by principal](#identifying-requests-by-principal)).
+2. The API key, when a validator is configured and accepted it.
+3. The payload key, when `with_payload_key` is set and the body parses.
+4. The client IP, resolved with the layer's `ClientIpStrategy`.
 
 ### Example: With Validator (API key validation enabled)
 
 ```rust
-use barnacle_rs::{BarnacleLayer, RedisBarnacleStore, BarnacleError};
+use barnacle_rs::{ApiKeyConfig, BarnacleLayer, RedisBarnacleStore, BarnacleError};
 use std::sync::Arc;
 use axum::http::request::Parts;
 
@@ -245,20 +204,20 @@ let api_key_validator = |api_key: String, api_key_config: ApiKeyConfig, parts: A
     }
 };
 
-let middleware: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _> = BarnacleLayer::builder()
+let middleware: BarnacleLayer<RedisBarnacleStore> = BarnacleLayer::builder()
     .with_store(store)
     .with_config(config)
     .with_api_key_validator(api_key_validator)
-    .with_state(())
     .build()
     .unwrap();
 ```
 
 **Note:**
-- The validator closure must take owned arguments: `(String, ApiKeyConfig, Arc<Parts>, State)`.
-- If you do not provide a validator, use `()` for the last type parameter.
-- If you provide a validator, use `_` for the last type parameter to let Rust infer the closure type.
-- If you provide a request modifier, use `_` for the last two type parameters to let Rust infer the types.
+- The validator closure must take owned arguments: `(String, ApiKeyConfig, Arc<Parts>, State)`
+  and return a `Result<(), E>` where `E: IntoResponse`; the error is answered as is.
+- The layer type is `BarnacleLayer<Store, State>`, `State` defaulting to `()`. A `()` state
+  doesn't need `with_state(())`; any other state must be set, or `build` fails with
+  `MissingState`.
 
 ### Request Modification
 
@@ -272,7 +231,7 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = RedisBarnacleStore::from_url("redis://127.0.0.1:6379").await?;
+    let store = RedisBarnacleStore::from_url("redis://127.0.0.1:6379")?;
     let config = BarnacleConfig::default();
 
     // Optional API key validator
@@ -290,10 +249,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "x-request-modified",
             "true".parse().unwrap()
         );
-        Ok(parts)
+        Ok::<_, BarnacleError>(parts)
     };
 
-    let layer: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _, _> = BarnacleLayer::builder()
+    let layer: BarnacleLayer<RedisBarnacleStore> = BarnacleLayer::builder()
         .with_store(store)
         .with_config(config)
         .with_api_key_validator(api_key_validator) // Optional: only if you want validation
@@ -316,11 +275,10 @@ async fn handler() -> &'static str {
 ```
 
 **Note:**
-- The modifier closure receives `(Parts, State)` and returns `Result<Parts, Error>`.
-- Modifications happen after successful validation but before request reconstruction.
-- Use `_` for the modifier type parameter to let Rust infer the closure type.
+- The modifier closure receives `(Parts, State)` and returns `Result<Parts, E>` where
+  `E: IntoResponse`; name the error type when Rust can't infer it (`Ok::<_, BarnacleError>(parts)`).
+- Modifications happen after successful validation but before the request is counted.
 - The modifier has access to all request parts (headers, extensions, URI, method, etc.).
-- If you don't provide a modifier, use `()` for the last type parameter.
 
 ### Running Examples
 
@@ -360,10 +318,9 @@ let config = BarnacleConfig::new(100, Duration::from_secs(3600));
 ```rust
 use barnacle_rs::{ClientIpStrategy, RateLimitScope, StoreFailurePolicy};
 
-let layer: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _> = BarnacleLayer::builder()
+let layer: BarnacleLayer<RedisBarnacleStore> = BarnacleLayer::builder()
     .with_store(store)
     .with_config(config)
-    .with_state(())
     .with_api_key_validator(api_key_validator)
     // One bucket per route template (`/users/{id}`) instead of per concrete path
     .with_scope(RateLimitScope::Route)
@@ -376,6 +333,8 @@ let layer: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _> = Barnacl
     .with_store_timeout(Duration::from_millis(200))
     // Maximum body size buffered to read a payload key (413 above it)
     .with_max_body_size(64 * 1024)
+    // Answer Barnacle's own errors (429, 503, 413) with the application's error type
+    .with_error::<AppError>()
     .build()?;
 ```
 
@@ -387,6 +346,13 @@ let layer: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _> = Barnacl
 | `with_store_failure_policy` | `FailClosed` | `FailClosed` answers 503 when the store fails; `FailOpen` lets the request through without rate limiting. |
 | `with_store_timeout` | none | Store operations slower than this count as failures. |
 | `with_max_body_size` | none | Only applies when the key is read from the payload. Otherwise the body is streamed to the handler without being buffered, and its size limit is up to the application. |
+| `with_limits` | set by `with_config` | Several limits per request, checked all or nothing. See [Multiple limits](#multiple-limits). |
+| `with_identifier` / `with_identity_resolver` | off | Key and limits per principal. See [Identifying requests by principal](#identifying-requests-by-principal). |
+| `with_mode` | `Mode::Enforce` | `Mode::Shadow` counts and reports but never rejects. See [Shadow mode](#shadow-mode-and-decisions). |
+| `on_decision` | off | Hook called with every rate limit decision. |
+| `with_payload_key::<T>()` | off | Read the key from the JSON body as `T: KeyExtractable`. |
+| `with_error::<E>()` | `BarnacleError` | Response type for Barnacle's own errors (`E: From<BarnacleError> + IntoResponse`). |
+| `with_reset_on_success` | set by `with_config` | Reset the request's counters on a successful response. |
 
 The peer address is only available when the server is started with
 `into_make_service_with_connect_info::<SocketAddr>()`.
@@ -459,6 +425,137 @@ let store = RedisBarnacleStore::from_url_with_options(
 To bound how long a *request* waits, use `with_store_timeout` together with a
 `StoreFailurePolicy`, instead of pool timeouts short enough to break connecting.
 
+## Identifying requests by principal
+
+An identifier decides who a request is counted for, and with which limits. It reads the
+request as the application's authentication middleware left it, so it can bucket every
+kind of credential the same way (API keys, bearer tokens, bots, users authenticated with a
+JWT) and apply the limits of the credential's tier.
+
+```rust
+use barnacle_rs::{BarnacleKey, BarnacleLayer, Identity, Limit, RateLimitScope, RedisBarnacleStore};
+use axum::http::request::Parts;
+
+fn tier_limits(principal: &Principal) -> Vec<Limit> {
+    match principal.tier {
+        Tier::Enterprise => vec![Limit::new(6000, Duration::from_secs(60))],
+        Tier::Standard => vec![Limit::new(600, Duration::from_secs(60))],
+        // Internal workers are not rate limited
+        Tier::Internal => vec![],
+    }
+}
+
+let layer: BarnacleLayer<RedisBarnacleStore> = BarnacleLayer::builder()
+    .with_store(store)
+    // Applied to requests the identifier doesn't resolve (e.g. unauthenticated ones)
+    .with_config(BarnacleConfig::new(60, Duration::from_secs(60)))
+    .with_scope(RateLimitScope::Named("public-api".into()))
+    .with_identifier(|parts: &Parts, _state: &()| {
+        let principal = parts.extensions.get::<Principal>()?;
+        Some(
+            Identity::new(BarnacleKey::Custom(principal.credential_id.clone()))
+                .with_limits(tier_limits(principal)),
+        )
+    })
+    .build()?;
+
+// The identifier reads what the authentication middleware stored: Barnacle must run
+// *inside* it, so add its layer first
+let app = Router::new()
+    .route("/organizations/{id}", get(handler))
+    .route_layer(layer)
+    .layer(axum::middleware::from_fn(authenticate));
+```
+
+- `None` falls back to Barnacle's own key (validated API key, payload key, client IP) and the
+  layer's limits.
+- `Identity::new(key)` without `with_limits` applies the layer's limits.
+- An empty list of limits counts nothing: the request is not rate limited.
+- The identifier runs after the API key validator and the request modifier. For a lookup
+  that has to be asynchronous, implement `IdentityResolver<State>` and pass it to
+  `with_identity_resolver`.
+
+## Multiple limits
+
+`with_limits` applies several limits to every request, and an identity can bring its own.
+They are checked by a single Lua script, all or nothing: when one limit rejects the request,
+no counter is incremented, so a request rejected by a route limit doesn't consume the global
+one.
+
+```rust
+use barnacle_rs::{Limit, RateLimitScope};
+
+let layer: BarnacleLayer<RedisBarnacleStore> = BarnacleLayer::builder()
+    .with_store(store)
+    .with_limits([
+        // Burst and sustained limits per credential, on every route of the layer
+        Limit::new(20, Duration::from_secs(1)).with_scope(RateLimitScope::Named("public-api:burst".into())),
+        Limit::new(600, Duration::from_secs(60)).with_scope(RateLimitScope::Named("public-api".into())),
+        // A stricter limit per route
+        Limit::new(6, Duration::from_secs(60)).with_scope(RateLimitScope::Route),
+    ])
+    .build()?;
+```
+
+- A limit without a scope uses the layer's scope (`with_scope`).
+- Every limit must count a different bucket, so each needs its own scope: two limits on the
+  same scope would share one counter. `build` rejects this with `DuplicateLimitScope`; limits
+  coming from an identity are checked per request and answered with 500. To combine a burst
+  and a sustained limit on the same routes, give them different `Named` scopes as above.
+- The response headers report the strictest limit: over the limit, the exceeded limit that
+  resets last (its reset is the `Retry-After`); otherwise the limit with the fewest requests
+  left, the one resetting last on a tie.
+- `ResetOnSuccess` resets every counter of the request.
+- Windows are counted in whole seconds, as before.
+- The keys of a request are passed to one script, so they must live in the same hash slot:
+  Redis Cluster is not supported.
+
+Custom stores get a default `BarnacleStore::increment_all` that handles one limit through
+`increment`; to support several limits per request, implement `increment_all` atomically.
+
+## Shadow mode and decisions
+
+`with_mode(Mode::Shadow)` counts requests, adds the rate limit headers and logs, but never
+rejects: not over a limit, not when the store fails, not over the failed validation limit.
+Counters behave exactly as when enforcing (a request that would be rejected is not counted),
+so what shadow mode reports is what enforcing would do. Use it to size new limits on real
+traffic before turning them on.
+
+`on_decision` is called with every decision, e.g. to record metrics:
+
+```rust
+use barnacle_rs::{DecisionOutcome, Mode, RateLimitDecision};
+
+let layer: BarnacleLayer<RedisBarnacleStore> = BarnacleLayer::builder()
+    .with_store(store)
+    .with_limits(new_limits)
+    .with_mode(Mode::Shadow)
+    .on_decision(|decision: &RateLimitDecision| {
+        for limit in &decision.limits {
+            // e.g. an OpenTelemetry counter
+            metrics.record(
+                decision.key_hash.as_str(), // never the key itself
+                format!("{:?}", limit.scope),
+                format!("{:?}", decision.outcome),
+                limit.remaining,
+            );
+        }
+    })
+    .build()?;
+```
+
+| Outcome | Meaning |
+| --- | --- |
+| `Allowed` | Every limit had room, the request was counted. |
+| `Rejected` | A limit was exceeded, the request was answered 429. |
+| `WouldReject` | A limit was exceeded in shadow mode, the request went through. |
+| `StoreFailure` | The store failed or timed out; the request went through with `FailOpen` or in shadow mode. |
+
+Each decision carries the key kind and a hash of the key (`BarnacleKey::hashed`), the mode,
+and per limit its scope, bucket, maximum, window, remaining requests, reset and whether it
+was exceeded. The hook runs on the request path: keep it fast. Requests shadow mode lets
+through over a limit are also logged at `info` level with the hashed key.
+
 ## Automatic Route-Based Rate Limiting
 
 Barnacle automatically includes route information (path and method) in Redis keys, providing per-endpoint rate limiting without any additional configuration:
@@ -506,6 +603,37 @@ answer `Ok(ApiKeyValidationResult::invalid())` only when the key genuinely does 
 and `Err(...)` when the lookup itself failed, so an outage is answered with a 5xx instead
 of looking like an invalid key (which would be a 401, and would count against the client's
 failed validation limit).
+
+## Upgrading from 0.4
+
+- **Breaking**: `BarnacleLayer` has two type parameters, `BarnacleLayer<Store, State = ()>`,
+  instead of six. The others moved to builder methods:
+  - the payload type `T`: `.with_payload_key::<T>()`;
+  - the error type `E`: `.with_error::<E>()` (the validator and the request modifier can
+    return any `IntoResponse` error, answered as is);
+  - the validator and modifier types `V` and `M` are gone: the closures are boxed.
+
+  So `BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _>` becomes
+  `BarnacleLayer<RedisBarnacleStore>`, and `BarnacleLayer<LoginRequest, RedisBarnacleStore>`
+  becomes `BarnacleLayer<RedisBarnacleStore>` with `.with_payload_key::<LoginRequest>()`.
+  A request modifier whose error type was inferred from the layer must name it
+  (`Ok::<_, BarnacleError>(parts)`).
+- **Breaking**: a validator, modifier or identifier that needs a state and has none is a
+  build error (`BarnacleLayerBuilderError::MissingState`) instead of a 500 on every request.
+  A `()` state no longer needs `with_state(())`. This removes the `unsafe` code that built
+  the `()` state.
+- **Breaking**: `ApiKeyConfig.cache_ttl_seconds` is removed (Barnacle never used it), and
+  `ApiKeyConfig::custom` only takes the header name.
+- **Breaking**: the `RequestModifier` trait is no longer exported; pass a closure to
+  `with_request_modifier`.
+- `BarnacleStore` has a new `increment_all` method, used for every request. Its default
+  implementation handles one limit through `increment`, so custom stores keep working with
+  one limit; implement it to use several limits per request.
+- Counters keep their Redis keys: a layer with one limit counts in the same keys as 0.4,
+  so upgrading doesn't reset them.
+- New: identifiers (`with_identifier`, `with_identity_resolver`), multiple limits
+  (`with_limits`, `Limit`), shadow mode (`with_mode`), the decision hook (`on_decision`),
+  `with_reset_on_success`, `BarnacleKey::kind` and `BarnacleKey::hashed`.
 
 ## Upgrading from 0.3
 

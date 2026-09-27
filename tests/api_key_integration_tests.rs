@@ -117,18 +117,17 @@ async fn create_test_app(path: &str) -> Router {
             Ok(())
         }
     };
-    let middleware: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _> =
-        BarnacleLayer::builder()
-            .with_store(rate_limit_store)
-            .with_config(barnacle_rs::BarnacleConfig {
-                max_requests: RATE_LIMIT_VALID,
-                window: Duration::from_secs(WINDOW_SECONDS),
-                ..Default::default()
-            })
-            .with_api_key_validator(api_key_validator)
-            .with_state(())
-            .build()
-            .unwrap();
+    let middleware: BarnacleLayer<RedisBarnacleStore> = BarnacleLayer::builder()
+        .with_store(rate_limit_store)
+        .with_config(barnacle_rs::BarnacleConfig {
+            max_requests: RATE_LIMIT_VALID,
+            window: Duration::from_secs(WINDOW_SECONDS),
+            ..Default::default()
+        })
+        .with_api_key_validator(api_key_validator)
+        .with_state(())
+        .build()
+        .unwrap();
 
     // Test endpoint
     Router::new()
@@ -307,18 +306,17 @@ mod api_keys {
                 Ok(())
             }
         };
-        let middleware: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, _> =
-            BarnacleLayer::builder()
-                .with_store(rate_limit_store)
-                .with_config(barnacle_rs::BarnacleConfig {
-                    max_requests: RATE_LIMIT_VALID,
-                    window: Duration::from_secs(WINDOW_SECONDS),
-                    ..Default::default()
-                })
-                .with_api_key_validator(api_key_validator)
-                .with_state(())
-                .build()
-                .unwrap();
+        let middleware: BarnacleLayer<RedisBarnacleStore> = BarnacleLayer::builder()
+            .with_store(rate_limit_store)
+            .with_config(barnacle_rs::BarnacleConfig {
+                max_requests: RATE_LIMIT_VALID,
+                window: Duration::from_secs(WINDOW_SECONDS),
+                ..Default::default()
+            })
+            .with_api_key_validator(api_key_validator)
+            .with_state(())
+            .build()
+            .unwrap();
 
         let app = Router::new()
             .route("/test", get(test_handler))

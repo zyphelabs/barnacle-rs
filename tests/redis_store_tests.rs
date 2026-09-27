@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use barnacle_rs::{
     deadpool_redis, hash_api_key, BarnacleConfig, BarnacleContext, BarnacleError, BarnacleKey,
-    BarnacleStore, RedisBarnacleStore, RedisPoolOptions, ResetOnSuccess,
+    BarnacleStore, Bucket, RedisBarnacleStore, RedisPoolOptions, ResetOnSuccess,
 };
 use uuid::Uuid;
 
@@ -200,4 +200,76 @@ async fn unreachable_redis_fails_fast_with_pool_timeouts() {
         .await
         .is_err());
     assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+/// Two buckets of the same client: a tight one and a loose one
+fn tight_and_loose() -> [Bucket; 2] {
+    let key = BarnacleKey::Custom(Uuid::new_v4().to_string());
+    let bucket = |path: &str, max_requests, window_secs| Bucket {
+        context: BarnacleContext::named(key.clone(), path),
+        max_requests,
+        window: Duration::from_secs(window_secs),
+    };
+    [bucket("tight", 5, 30), bucket("loose", 100, 60)]
+}
+
+async fn count(bucket: &Bucket) -> Option<u32> {
+    let BarnacleKey::Custom(id) = &bucket.context.key else {
+        unreachable!()
+    };
+    let key = format!(
+        "barnacle:custom:{}:{}:{}",
+        id, bucket.context.method, bucket.context.path
+    );
+    let mut conn = connection().await;
+    deadpool_redis::redis::cmd("GET")
+        .arg(&key)
+        .query_async(&mut conn)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_rejection_does_not_consume_the_other_limits() {
+    let store = store();
+    let buckets = tight_and_loose();
+
+    for _ in 0..5 {
+        let states = store.increment_all(&buckets).await.unwrap();
+        assert!(states.iter().all(|state| !state.exceeded));
+    }
+    let states = store.increment_all(&buckets).await.unwrap();
+    assert!(states[0].exceeded);
+    assert_eq!(states[0].remaining, 0);
+    assert!(!states[1].exceeded);
+    assert_eq!(states[1].remaining, 95);
+    assert_eq!(count(&buckets[1]).await, Some(5));
+    // Each bucket reports its own window
+    assert!(states[0].reset_after.as_secs() <= 30);
+    assert!(states[1].reset_after.as_secs() > 30);
+}
+
+#[tokio::test]
+async fn concurrent_requests_are_counted_all_or_nothing() {
+    let store = store();
+    let buckets = tight_and_loose();
+
+    let attempts = (0..50).map(|_| {
+        let store = store.clone();
+        let buckets = buckets.clone();
+        tokio::spawn(async move { store.increment_all(&buckets).await.unwrap() })
+    });
+    let results = futures::future::join_all(attempts).await;
+    let allowed = results
+        .iter()
+        .filter(|states| states.as_ref().unwrap().iter().all(|state| !state.exceeded))
+        .count();
+    assert_eq!(allowed, 5);
+    // The 45 rejected requests did not consume the loose bucket
+    assert_eq!(count(&buckets[1]).await, Some(5));
+}
+
+#[tokio::test]
+async fn increment_all_with_no_buckets_touches_nothing() {
+    assert!(store().increment_all(&[]).await.unwrap().is_empty());
 }
