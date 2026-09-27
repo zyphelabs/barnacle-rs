@@ -559,6 +559,15 @@ and per limit its scope, bucket, maximum, window, remaining requests, reset and 
 was exceeded. The hook runs on the request path: keep it fast. Requests shadow mode lets
 through over a limit are also logged at `info` level with the hashed key.
 
+The failed validation limit also reports decisions, keyed by the client IP hash under
+`RateLimitScope::Named(FAILED_VALIDATION_SCOPE.into())`. `Allowed` means the authentication
+failure was counted within that limit; the validator still returns its authentication
+error. A rejected precheck reports `Rejected` or `WouldReject`, and store errors report
+`StoreFailure`. Each request produces at most one decision for this limit: a precheck
+failure takes precedence over the subsequent increment. If shadow mode or `FailOpen`
+lets a valid key proceed after a failed precheck, the regular request limit can produce
+another decision for that key.
+
 ## Automatic Route-Based Rate Limiting
 
 Barnacle automatically includes route information (path and method) in Redis keys, providing per-endpoint rate limiting without any additional configuration:

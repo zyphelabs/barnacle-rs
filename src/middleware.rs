@@ -24,8 +24,8 @@ use crate::limits::{
     RateLimitDecision,
 };
 use crate::types::{
-    ApiKeyConfig, BarnacleConfig, BarnacleContext, BarnacleKey, ClientIpStrategy, RateLimitScope,
-    ResetOnSuccess, StoreFailurePolicy, NO_KEY,
+    ApiKeyConfig, BarnacleConfig, BarnacleContext, BarnacleKey, BarnacleResult, ClientIpStrategy,
+    RateLimitScope, ResetOnSuccess, StoreFailurePolicy, NO_KEY,
 };
 use crate::BarnacleStore;
 use crate::RedisBarnacleStore;
@@ -281,8 +281,10 @@ where
         self.settings.mode = mode;
         self
     }
-    /// Called for every counted request with the decision taken, e.g. to record
-    /// metrics. It runs on the request path: keep it fast and non-blocking.
+    /// Called for every rate limit decision, including the failed validation limit.
+    /// A request can produce both a failed validation limit decision and a regular
+    /// request limit decision in shadow mode or with a fail-open store policy.
+    /// It runs on the request path: keep it fast and non-blocking.
     pub fn on_decision(
         mut self,
         hook: impl Fn(&RateLimitDecision) + Send + Sync + 'static,
@@ -711,6 +713,48 @@ impl<State> Settings<State> {
         }
     }
 
+    fn decision_outcome(&self, exceeded: bool) -> DecisionOutcome {
+        match (exceeded, self.mode) {
+            (false, _) => DecisionOutcome::Allowed,
+            (true, Mode::Enforce) => DecisionOutcome::Rejected,
+            (true, Mode::Shadow) => DecisionOutcome::WouldReject,
+        }
+    }
+
+    /// Reports the failed validation counter using the same decision format as request limits.
+    fn report_failed_validation(
+        &self,
+        context: &BarnacleContext,
+        limit: &BarnacleConfig,
+        result: &Result<BarnacleResult, BarnacleError>,
+    ) {
+        let (exceeded, remaining, reset_after) = match result {
+            Ok(counted) => (
+                false,
+                counted.remaining,
+                counted.retry_after.unwrap_or(limit.window),
+            ),
+            Err(BarnacleError::RateLimitExceeded { retry_after, .. }) => {
+                (true, 0, Duration::from_secs(*retry_after))
+            }
+            Err(_) => {
+                self.report(&context.key, DecisionOutcome::StoreFailure, Vec::new);
+                return;
+            }
+        };
+        self.report(&context.key, self.decision_outcome(exceeded), || {
+            vec![LimitOutcome {
+                scope: RateLimitScope::Named(FAILED_VALIDATION_SCOPE.into()),
+                bucket: context.path.clone(),
+                max_requests: limit.max_requests,
+                window: limit.window,
+                remaining,
+                reset_after,
+                exceeded,
+            }]
+        });
+    }
+
     fn context(
         &self,
         scope: &RateLimitScope,
@@ -810,8 +854,14 @@ where
         // Reading the counter before the validator runs is what keeps a brute-force
         // client from costing a key lookup per attempt: it can't be merged with the
         // increment below, which only happens after the validator answered.
+        let mut failed_validation_reported = false;
         if let Some((context, limit)) = &failed_validation {
-            match call_store(self.store_timeout, store.peek(context, limit)).await {
+            let result = call_store(self.store_timeout, store.peek(context, limit)).await;
+            if result.is_err() {
+                self.report_failed_validation(context, limit, &result);
+                failed_validation_reported = true;
+            }
+            match result {
                 Ok(_) => {}
                 Err(error @ BarnacleError::RateLimitExceeded { .. }) => {
                     if self.mode == Mode::Enforce {
@@ -854,7 +904,13 @@ where
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
             );
             if let Some((context, limit)) = failed_validation.filter(|_| authentication_failed) {
-                match call_store(self.store_timeout, store.increment(&context, limit)).await {
+                let result = call_store(self.store_timeout, store.increment(&context, limit)).await;
+                // Shadow mode or fail-open can reach this point after a failed precheck.
+                // Keep its decision instead of reporting the same limit twice.
+                if !failed_validation_reported {
+                    self.report_failed_validation(&context, limit, &result);
+                }
+                match result {
                     Ok(_) => {}
                     // Another request reached the limit in the meantime
                     Err(error @ BarnacleError::RateLimitExceeded { .. }) => {
@@ -956,11 +1012,7 @@ where
             }
         };
 
-        let outcome = match (states.iter().any(|state| state.exceeded), self.mode) {
-            (false, _) => DecisionOutcome::Allowed,
-            (true, Mode::Enforce) => DecisionOutcome::Rejected,
-            (true, Mode::Shadow) => DecisionOutcome::WouldReject,
-        };
+        let outcome = self.decision_outcome(states.iter().any(|state| state.exceeded));
         self.report(key, outcome, || {
             limits
                 .iter()

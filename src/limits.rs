@@ -112,6 +112,9 @@ pub struct BucketState {
 
 /// What happened to a rate limited request, reported to the hook set with
 /// `BarnacleLayerBuilder::on_decision`.
+///
+/// The failed validation limit reports separately from regular request limits. Its
+/// decision describes the limiter, independently of the validator's response.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RateLimitDecision {
     /// Kind of key the request was counted for: `email`, `api_key`, `ip` or `custom`.
@@ -128,7 +131,7 @@ pub struct RateLimitDecision {
 /// Outcome of a [`RateLimitDecision`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecisionOutcome {
-    /// Every limit had room: the request was counted.
+    /// Every reported limit had room: the request (or authentication failure) was counted.
     Allowed,
     /// A limit was exceeded and the request was rejected with 429.
     Rejected,

@@ -1628,6 +1628,214 @@ mod shadow {
         assert_eq!(attempts, [401, 401, 200]);
     }
 
+    fn keyed_call(key: &str) -> Request<Body> {
+        with_peer(
+            request("GET", "/a")
+                .header("x-api-key", key)
+                .body(Body::empty())
+                .unwrap(),
+            "1.1.1.1:1",
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_validation_decisions_are_reported_once_per_limit() {
+        for mode in [Mode::Enforce, Mode::Shadow] {
+            let (decisions, hook) = recorder();
+            let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
+                .with_store(MemoryStore::default())
+                .with_config(limit(100))
+                .with_api_key_validator(validator())
+                .with_failed_validation_limit(limit(1))
+                .with_mode(mode)
+                .on_decision(hook)
+                .build()
+                .unwrap();
+            let app = Router::new()
+                .route("/a", get(|| async { "ok" }))
+                .route_layer(layer);
+
+            // A successful precheck does not count a failed validation or emit an event.
+            assert_eq!(
+                send(&app, keyed_call(VALID_KEY)).await.status(),
+                StatusCode::OK
+            );
+            assert_eq!(outcomes(&decisions), [DecisionOutcome::Allowed]);
+            assert_eq!(decisions.lock().unwrap()[0].key_kind, "api_key");
+            decisions.lock().unwrap().clear();
+
+            let attempts = statuses(&app, ["guess-1", "guess-2", VALID_KEY].map(keyed_call)).await;
+            let rejected = if mode == Mode::Enforce {
+                assert_eq!(attempts, [401, 429, 429]);
+                DecisionOutcome::Rejected
+            } else {
+                assert_eq!(attempts, [401, 401, 200]);
+                DecisionOutcome::WouldReject
+            };
+            let mut expected = vec![DecisionOutcome::Allowed, rejected, rejected];
+            if mode == Mode::Shadow {
+                // The valid key also reaches the regular request limit after the bypass.
+                expected.push(DecisionOutcome::Allowed);
+            }
+            assert_eq!(outcomes(&decisions), expected);
+            let recorded = decisions.lock().unwrap();
+            for (index, decision) in recorded[..3].iter().enumerate() {
+                assert_eq!(decision.mode, mode);
+                assert_eq!(decision.key_kind, "ip");
+                assert_eq!(
+                    decision.key_hash,
+                    BarnacleKey::Ip("1.1.1.1".into()).hashed()
+                );
+                assert_eq!(decision.limits.len(), 1);
+                let limit = &decision.limits[0];
+                assert_eq!(
+                    limit.scope,
+                    RateLimitScope::Named(FAILED_VALIDATION_SCOPE.into())
+                );
+                assert_eq!(limit.bucket, FAILED_VALIDATION_SCOPE);
+                assert_eq!(limit.max_requests, 1);
+                assert_eq!(limit.window, Duration::from_secs(60));
+                assert_eq!(limit.reset_after, Duration::from_secs(42));
+                assert_eq!(limit.remaining, 0);
+                assert_eq!(limit.exceeded, index > 0);
+            }
+            if mode == Mode::Shadow {
+                assert_eq!(recorded[3].key_kind, "api_key");
+                assert_eq!(recorded[3].limits[0].scope, RateLimitScope::Path);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_validation_rejections_after_the_precheck_are_reported() {
+        for mode in [Mode::Enforce, Mode::Shadow] {
+            let store = MemoryStore::default();
+            let racing_store = store.clone();
+            let (decisions, hook) = recorder();
+            let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
+                .with_store(store)
+                .with_config(limit(100))
+                .with_api_key_validator(
+                    move |key: String, _: ApiKeyConfig, _: Arc<Parts>, _: ()| {
+                        let store = racing_store.clone();
+                        async move {
+                            // Another validation fills the bucket while this validator is running.
+                            store
+                                .increment(
+                                    &BarnacleContext::named(
+                                        BarnacleKey::Ip("1.1.1.1".into()),
+                                        FAILED_VALIDATION_SCOPE,
+                                    ),
+                                    &limit(1),
+                                )
+                                .await
+                                .unwrap();
+                            Err::<(), _>(BarnacleError::invalid_api_key(key))
+                        }
+                    },
+                )
+                .with_failed_validation_limit(limit(1))
+                .with_mode(mode)
+                .on_decision(hook)
+                .build()
+                .unwrap();
+            let app = Router::new()
+                .route("/a", get(|| async { "ok" }))
+                .route_layer(layer);
+            let response = send(&app, keyed_call("guess")).await;
+            if mode == Mode::Enforce {
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(outcomes(&decisions), [DecisionOutcome::Rejected]);
+            } else {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                assert_eq!(outcomes(&decisions), [DecisionOutcome::WouldReject]);
+            }
+            assert!(decisions.lock().unwrap()[0].limits[0].exceeded);
+        }
+    }
+
+    #[derive(Clone)]
+    struct ValidationFailureStore {
+        fail_peek: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl BarnacleStore for ValidationFailureStore {
+        async fn increment(
+            &self,
+            _: &BarnacleContext,
+            _: &BarnacleConfig,
+        ) -> Result<BarnacleResult, BarnacleError> {
+            Err(BarnacleError::store_error("store down"))
+        }
+
+        async fn peek(
+            &self,
+            _: &BarnacleContext,
+            config: &BarnacleConfig,
+        ) -> Result<BarnacleResult, BarnacleError> {
+            if self.fail_peek {
+                Err(BarnacleError::store_error("store down"))
+            } else {
+                Ok(BarnacleResult {
+                    allowed: true,
+                    remaining: config.max_requests,
+                    retry_after: None,
+                })
+            }
+        }
+
+        async fn reset(&self, _: &BarnacleContext) -> Result<(), BarnacleError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_validation_store_failures_are_reported_once() {
+        for fail_peek in [true, false] {
+            for (mode, policy) in [
+                (Mode::Enforce, StoreFailurePolicy::FailClosed),
+                (Mode::Enforce, StoreFailurePolicy::FailOpen),
+                (Mode::Shadow, StoreFailurePolicy::FailClosed),
+            ] {
+                let (decisions, hook) = recorder();
+                let layer: BarnacleLayer<ValidationFailureStore> = BarnacleLayer::builder()
+                    .with_store(ValidationFailureStore { fail_peek })
+                    .with_config(limit(100))
+                    .with_api_key_validator(validator())
+                    .with_failed_validation_limit(limit(1))
+                    .with_mode(mode)
+                    .with_store_failure_policy(policy)
+                    .on_decision(hook)
+                    .build()
+                    .unwrap();
+                let app = Router::new()
+                    .route("/a", get(|| async { "ok" }))
+                    .route_layer(layer);
+                let response = send(&app, keyed_call("guess")).await;
+                let fail_closed =
+                    fail_peek && mode == Mode::Enforce && policy == StoreFailurePolicy::FailClosed;
+                assert_eq!(
+                    response.status(),
+                    if fail_closed {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::UNAUTHORIZED
+                    }
+                );
+                assert_eq!(outcomes(&decisions), [DecisionOutcome::StoreFailure]);
+                let recorded = decisions.lock().unwrap();
+                assert_eq!(recorded[0].mode, mode);
+                assert_eq!(recorded[0].key_kind, "ip");
+                assert_eq!(
+                    recorded[0].key_hash,
+                    BarnacleKey::Ip("1.1.1.1".into()).hashed()
+                );
+                assert!(recorded[0].limits.is_empty());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn the_decision_hook_reports_enforced_rejections_with_a_hashed_key() {
         let (decisions, hook) = recorder();
