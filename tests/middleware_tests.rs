@@ -1790,6 +1790,65 @@ mod shadow {
         }
     }
 
+    /// Store whose precheck fails while the increment finds the bucket full
+    #[derive(Clone)]
+    struct FullAfterFailedPeekStore;
+
+    #[async_trait::async_trait]
+    impl BarnacleStore for FullAfterFailedPeekStore {
+        async fn increment(
+            &self,
+            _: &BarnacleContext,
+            config: &BarnacleConfig,
+        ) -> Result<BarnacleResult, BarnacleError> {
+            Err(BarnacleError::rate_limit_exceeded(
+                0,
+                42,
+                config.max_requests,
+            ))
+        }
+
+        async fn peek(
+            &self,
+            _: &BarnacleContext,
+            _: &BarnacleConfig,
+        ) -> Result<BarnacleResult, BarnacleError> {
+            Err(BarnacleError::store_error("store down"))
+        }
+
+        async fn reset(&self, _: &BarnacleContext) -> Result<(), BarnacleError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_increment_decides_the_report_after_a_fail_open_precheck() {
+        for mode in [Mode::Enforce, Mode::Shadow] {
+            let (decisions, hook) = recorder();
+            let layer: BarnacleLayer<FullAfterFailedPeekStore> = BarnacleLayer::builder()
+                .with_store(FullAfterFailedPeekStore)
+                .with_config(limit(100))
+                .with_api_key_validator(validator())
+                .with_failed_validation_limit(limit(1))
+                .with_store_failure_policy(StoreFailurePolicy::FailOpen)
+                .with_mode(mode)
+                .on_decision(hook)
+                .build()
+                .unwrap();
+            let app = Router::new()
+                .route("/a", get(|| async { "ok" }))
+                .route_layer(layer);
+            let response = send(&app, keyed_call("guess")).await;
+            let (status, outcome) = match mode {
+                Mode::Enforce => (StatusCode::TOO_MANY_REQUESTS, DecisionOutcome::Rejected),
+                Mode::Shadow => (StatusCode::UNAUTHORIZED, DecisionOutcome::WouldReject),
+            };
+            assert_eq!(response.status(), status);
+            assert_eq!(outcomes(&decisions), [outcome]);
+            assert!(decisions.lock().unwrap()[0].limits[0].exceeded);
+        }
+    }
+
     #[tokio::test]
     async fn failed_validation_store_failures_are_reported_once() {
         for fail_peek in [true, false] {

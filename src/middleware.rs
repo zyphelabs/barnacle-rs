@@ -854,17 +854,28 @@ where
         // Reading the counter before the validator runs is what keeps a brute-force
         // client from costing a key lookup per attempt: it can't be merged with the
         // increment below, which only happens after the validator answered.
-        let mut failed_validation_reported = false;
+        //
+        // A precheck that fails without ending the request (shadow mode, fail-open) is
+        // reported once the validation is known, so that a later increment deciding the
+        // outcome replaces it: one event per limit, matching the response.
+        let mut pending_precheck = None;
         if let Some((context, limit)) = &failed_validation {
             let result = call_store(self.store_timeout, store.peek(context, limit)).await;
-            if result.is_err() {
+            let ends_request = match &result {
+                Ok(_) => false,
+                Err(BarnacleError::RateLimitExceeded { .. }) => self.mode == Mode::Enforce,
+                Err(_) => {
+                    self.mode == Mode::Enforce
+                        && self.store_failure_policy == StoreFailurePolicy::FailClosed
+                }
+            };
+            if ends_request {
                 self.report_failed_validation(context, limit, &result);
-                failed_validation_reported = true;
             }
             match result {
                 Ok(_) => {}
                 Err(error @ BarnacleError::RateLimitExceeded { .. }) => {
-                    if self.mode == Mode::Enforce {
+                    if ends_request {
                         debug!(
                             "Rejecting key {:?}: too many failed API key validations",
                             context.key
@@ -875,14 +886,22 @@ where
                         "Shadow mode: too many failed API key validations for {}, letting the request through",
                         context.key.hashed()
                     );
+                    pending_precheck = Some(Err(error));
                 }
                 Err(error) => {
+                    let error_text = error.to_string();
                     if let Some(response) = self.store_failure(error) {
                         return Err(response);
                     }
+                    pending_precheck = Some(Err(BarnacleError::store_error(error_text)));
                 }
             }
         }
+        let report_precheck = |pending: Option<Result<BarnacleResult, BarnacleError>>| {
+            if let (Some((context, limit)), Some(result)) = (&failed_validation, pending) {
+                self.report_failed_validation(context, limit, &result);
+            }
+        };
 
         let validation = validator(
             api_key.clone(),
@@ -903,12 +922,19 @@ where
                 response.status(),
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
             );
-            if let Some((context, limit)) = failed_validation.filter(|_| authentication_failed) {
-                let result = call_store(self.store_timeout, store.increment(&context, limit)).await;
-                // Shadow mode or fail-open can reach this point after a failed precheck.
-                // Keep its decision instead of reporting the same limit twice.
-                if !failed_validation_reported {
-                    self.report_failed_validation(&context, limit, &result);
+            if let Some((context, limit)) =
+                failed_validation.as_ref().filter(|_| authentication_failed)
+            {
+                let result = call_store(self.store_timeout, store.increment(context, limit)).await;
+                // The increment decides the outcome, unless it failed: then the failed
+                // precheck, if any, is still the best account of the request
+                match (&result, pending_precheck) {
+                    (Err(error), Some(precheck))
+                        if !matches!(error, BarnacleError::RateLimitExceeded { .. }) =>
+                    {
+                        report_precheck(Some(precheck))
+                    }
+                    _ => self.report_failed_validation(context, limit, &result),
                 }
                 match result {
                     Ok(_) => {}
@@ -920,9 +946,12 @@ where
                     }
                     Err(error) => warn!("Failed to count failed API key validation: {}", error),
                 }
+            } else {
+                report_precheck(pending_precheck);
             }
             return Err(response);
         }
+        report_precheck(pending_precheck);
         Ok(Some(api_key).filter(|api_key| !api_key.is_empty()))
     }
 
