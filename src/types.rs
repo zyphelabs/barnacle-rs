@@ -45,7 +45,14 @@ impl BarnacleConfig {
 
     /// Check if a status code should be considered successful for rate limit reset
     pub fn is_success_status(&self, status_code: u16) -> bool {
-        match &self.reset_on_success {
+        self.reset_on_success.is_success_status(status_code)
+    }
+}
+
+impl ResetOnSuccess {
+    /// Whether a response with `status_code` resets the counters
+    pub fn is_success_status(&self, status_code: u16) -> bool {
+        match self {
             ResetOnSuccess::Not => false,
             ResetOnSuccess::Yes(success_codes) | ResetOnSuccess::Multiple(success_codes, _) => {
                 if let Some(codes) = success_codes {
@@ -81,6 +88,29 @@ impl std::fmt::Debug for BarnacleKey {
                 .finish(),
             BarnacleKey::Ip(ip) => f.debug_tuple("Ip").field(ip).finish(),
             BarnacleKey::Custom(custom) => f.debug_tuple("Custom").field(custom).finish(),
+        }
+    }
+}
+
+impl BarnacleKey {
+    /// Kind of key: `email`, `api_key`, `ip` or `custom`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            BarnacleKey::Email(_) => "email",
+            BarnacleKey::ApiKey(_) => "api_key",
+            BarnacleKey::Ip(_) => "ip",
+            BarnacleKey::Custom(_) => "custom",
+        }
+    }
+
+    /// Log-safe representation of the key's value: a short prefix of its SHA-256,
+    /// the same for every kind of key (see [`redact_api_key`]).
+    pub fn hashed(&self) -> String {
+        match self {
+            BarnacleKey::Email(value)
+            | BarnacleKey::ApiKey(value)
+            | BarnacleKey::Ip(value)
+            | BarnacleKey::Custom(value) => redact_api_key(value),
         }
     }
 }
@@ -247,9 +277,8 @@ impl ApiKeyValidationResult {
 /// Configuration for API key middleware
 #[derive(Clone, Debug)]
 pub struct ApiKeyConfig {
+    /// Header the API key is read from (default: `x-api-key`)
     pub header_name: String,
-    /// TTL for caching API keys validated by custom validator (in seconds)
-    pub cache_ttl_seconds: u64,
 }
 
 impl ApiKeyConfig {
@@ -257,10 +286,10 @@ impl ApiKeyConfig {
         Default::default()
     }
 
-    pub fn custom(header_name: String, cache_ttl_seconds: u64) -> Self {
+    /// Read the API key from `header_name`
+    pub fn custom(header_name: impl Into<String>) -> Self {
         Self {
-            header_name,
-            cache_ttl_seconds, // 1 hour default
+            header_name: header_name.into(),
         }
     }
 }
@@ -269,7 +298,6 @@ impl Default for ApiKeyConfig {
     fn default() -> Self {
         Self {
             header_name: "x-api-key".to_string(),
-            cache_ttl_seconds: 60 * 60, // 1 hour default
         }
     }
 }

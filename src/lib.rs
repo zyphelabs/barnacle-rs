@@ -6,7 +6,10 @@
 //!
 //! - **Rate Limiting**: Configurable rate limiting with Redis backend
 //! - **API Key Validation**: Validate requests using x-api-key header
-//! - **Per-Key Rate Limits**: Different rate limits per API key
+//! - **Per-Principal Rate Limits**: Buckets and limits per authenticated principal
+//!   (see [`BarnacleLayerBuilder::with_identifier`])
+//! - **Multiple Atomic Limits**: Several [`Limit`]s per request, all or nothing
+//! - **Shadow Mode**: Measure limits before enforcing them (see [`Mode::Shadow`])
 //! - **Extensible Design**: Custom key stores and rate limiting strategies
 //! - **Redis Integration**: Default Redis-based storage for keys and rate limits
 //! - **Axum Middleware**: Ready-to-use middleware for Axum web framework
@@ -32,7 +35,7 @@
 //!
 //! // Create a Barnacle layer using the builder pattern
 //! #[cfg(feature = "redis")]
-//! let layer: BarnacleLayer<(), RedisBarnacleStore, ()> = BarnacleLayer::builder()
+//! let layer: BarnacleLayer<RedisBarnacleStore> = BarnacleLayer::builder()
 //!     .with_store(rate_limit_store)
 //!     .with_config(BarnacleConfig::default())
 //!     .build()?;
@@ -47,6 +50,7 @@
 
 mod api_key_store;
 mod error;
+mod limits;
 mod middleware;
 mod redis_store;
 mod types;
@@ -54,9 +58,12 @@ mod types;
 // Re-export key items for easier access
 pub use api_key_store::{ApiKeyStore, StaticApiKeyStore};
 pub use error::BarnacleError;
+pub use limits::{
+    Bucket, BucketState, DecisionOutcome, Identity, Limit, LimitOutcome, Mode, RateLimitDecision,
+};
 pub use middleware::{
-    client_ip, client_ip_key, BarnacleLayer, BarnacleLayerBuilderError, KeyExtractable,
-    RequestModifier, FAILED_VALIDATION_SCOPE,
+    client_ip, client_ip_key, BarnacleLayer, BarnacleLayerBuilder, BarnacleLayerBuilderError,
+    BarnacleMiddleware, IdentityResolver, KeyExtractable, FAILED_VALIDATION_SCOPE,
 };
 pub use tracing;
 pub use types::{
@@ -76,6 +83,7 @@ pub use deadpool_redis;
 pub use ipnet;
 
 use async_trait::async_trait;
+use std::time::Duration;
 
 pub const BARNACLE_EMAIL_KEY_PREFIX: &str = "barnacle:email";
 pub const BARNACLE_API_KEY_PREFIX: &str = "barnacle:api_keys";
@@ -116,5 +124,42 @@ pub trait BarnacleStore: Clone + Send + Sync {
         Err(BarnacleError::store_error(
             "This store does not implement `peek`, required by the failed validation limit",
         ))
+    }
+
+    /// Checks every bucket and increments them all, atomically and all or nothing: when
+    /// one bucket is full, none is incremented.
+    ///
+    /// Returns one [`BucketState`] per bucket, in the same order. A full bucket is
+    /// reported with [`BucketState::exceeded`], not as an error: errors are reserved for
+    /// store failures.
+    ///
+    /// The layer counts every request through this method. The default implementation
+    /// handles a single bucket with [`BarnacleStore::increment`], so a custom store keeps
+    /// working with one limit per request; it returns a store error for more than one,
+    /// since counting them one by one would not be atomic.
+    async fn increment_all(&self, buckets: &[Bucket]) -> Result<Vec<BucketState>, BarnacleError> {
+        match buckets {
+            [] => Ok(Vec::new()),
+            [bucket] => {
+                let config = BarnacleConfig::new(bucket.max_requests, bucket.window);
+                let state = match self.increment(&bucket.context, &config).await {
+                    Ok(result) => BucketState {
+                        exceeded: false,
+                        remaining: result.remaining,
+                        reset_after: result.retry_after.unwrap_or(bucket.window),
+                    },
+                    Err(BarnacleError::RateLimitExceeded { retry_after, .. }) => BucketState {
+                        exceeded: true,
+                        remaining: 0,
+                        reset_after: Duration::from_secs(retry_after),
+                    },
+                    Err(error) => return Err(error),
+                };
+                Ok(vec![state])
+            }
+            _ => Err(BarnacleError::store_error(
+                "This store does not implement `increment_all`, required by multiple limits per request",
+            )),
+        }
     }
 }

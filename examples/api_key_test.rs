@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let middleware: BarnacleLayer<(), _, _, BarnacleError, _> = BarnacleLayer::builder()
+    let middleware: BarnacleLayer<_> = BarnacleLayer::builder()
         .with_store(store)
         .with_config(config)
         .with_api_key_validator(api_key_validator)

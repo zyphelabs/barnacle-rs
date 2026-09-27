@@ -13,19 +13,21 @@ use axum::{
 };
 use barnacle_rs::{
     client_ip, client_ip_key, ApiKeyConfig, BarnacleConfig, BarnacleContext, BarnacleError,
-    BarnacleKey, BarnacleLayer, BarnacleResult, BarnacleStore, ClientIpStrategy, KeyExtractable,
-    RateLimitScope, ResetOnSuccess, StoreFailurePolicy, ANY_METHOD, FAILED_VALIDATION_SCOPE,
+    BarnacleKey, BarnacleLayer, BarnacleLayerBuilderError, BarnacleResult, BarnacleStore, Bucket,
+    BucketState, ClientIpStrategy, DecisionOutcome, Identity, IdentityResolver, KeyExtractable,
+    Limit, Mode, RateLimitDecision, RateLimitScope, ResetOnSuccess, StoreFailurePolicy, ANY_METHOD,
+    FAILED_VALIDATION_SCOPE,
 };
 use http_body_util::BodyExt;
 use serde::Deserialize;
 use tower::ServiceExt;
 
-type Bucket = (BarnacleKey, String, String);
+type Counter = (BarnacleKey, String, String);
 
 /// In-memory store recording every context it counts
 #[derive(Clone, Default)]
 struct MemoryStore {
-    counters: Arc<Mutex<HashMap<Bucket, u32>>>,
+    counters: Arc<Mutex<HashMap<Counter, u32>>>,
 }
 
 impl MemoryStore {
@@ -37,11 +39,11 @@ impl MemoryStore {
             .unwrap_or(0)
     }
 
-    fn keys(&self) -> Vec<Bucket> {
+    fn keys(&self) -> Vec<Counter> {
         self.counters.lock().unwrap().keys().cloned().collect()
     }
 
-    fn entry(context: &BarnacleContext) -> Bucket {
+    fn entry(context: &BarnacleContext) -> Counter {
         (
             context.key.clone(),
             context.path.clone(),
@@ -98,6 +100,35 @@ impl BarnacleStore for MemoryStore {
             remaining: config.max_requests - count,
             retry_after: None,
         })
+    }
+
+    async fn increment_all(&self, buckets: &[Bucket]) -> Result<Vec<BucketState>, BarnacleError> {
+        // One lock for the whole check, like the Redis script
+        let mut counters = self.counters.lock().unwrap();
+        let exceeded: Vec<bool> = buckets
+            .iter()
+            .map(|bucket| {
+                counters
+                    .get(&Self::entry(&bucket.context))
+                    .is_some_and(|count| *count >= bucket.max_requests)
+            })
+            .collect();
+        let allowed = !exceeded.contains(&true);
+        Ok(buckets
+            .iter()
+            .zip(exceeded)
+            .map(|(bucket, exceeded)| {
+                let count = counters.entry(Self::entry(&bucket.context)).or_insert(0);
+                if allowed {
+                    *count += 1;
+                }
+                BucketState {
+                    exceeded,
+                    remaining: bucket.max_requests.saturating_sub(*count),
+                    reset_after: bucket.window,
+                }
+            })
+            .collect())
     }
 }
 
@@ -199,7 +230,7 @@ mod scope {
     use super::*;
 
     fn app(store: MemoryStore, scope: RateLimitScope) -> Router {
-        let layer: BarnacleLayer<(), MemoryStore> = BarnacleLayer::builder()
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
             .with_store(store)
             .with_config(limit(2))
             .with_scope(scope)
@@ -319,7 +350,7 @@ mod scope {
     #[tokio::test]
     async fn nested_routes_share_one_bucket_inside_and_outside_the_middleware() {
         let store = MemoryStore::default();
-        let layer: BarnacleLayer<(), MemoryStore> = BarnacleLayer::builder()
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
             .with_store(store.clone())
             .with_config(limit(10))
             .build()
@@ -348,7 +379,7 @@ mod client_ip_strategy {
     use super::*;
 
     fn app(store: MemoryStore, strategy: ClientIpStrategy) -> Router {
-        let layer: BarnacleLayer<(), MemoryStore> = BarnacleLayer::builder()
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
             .with_store(store)
             .with_config(limit(100))
             .with_client_ip_strategy(strategy)
@@ -541,15 +572,14 @@ mod client_ip_strategy {
             rebuilt.headers = parts.headers;
             Ok::<_, BarnacleError>(rebuilt)
         };
-        let layer: BarnacleLayer<(), MemoryStore, (), BarnacleError, (), _> =
-            BarnacleLayer::builder()
-                .with_store(store.clone())
-                .with_config(limit(100))
-                .with_state(())
-                .with_client_ip_strategy(trusted())
-                .with_request_modifier(modifier)
-                .build()
-                .unwrap();
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
+            .with_store(store.clone())
+            .with_config(limit(100))
+            .with_state(())
+            .with_client_ip_strategy(trusted())
+            .with_request_modifier(modifier)
+            .build()
+            .unwrap();
         let app = Router::new()
             .route(
                 "/ip",
@@ -575,7 +605,7 @@ mod api_keys {
     use super::*;
 
     fn app(store: MemoryStore) -> Router {
-        let layer: BarnacleLayer<(), MemoryStore, (), BarnacleError, _> = BarnacleLayer::builder()
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
             .with_store(store)
             .with_config(limit(100))
             .with_state(())
@@ -694,7 +724,7 @@ mod api_keys {
             move |_key: String, _config: ApiKeyConfig, _parts: Arc<Parts>, _state: ()| {
                 Box::pin(async move { Err(error()) }) as ValidationFuture
             };
-        let layer: BarnacleLayer<(), MemoryStore, (), BarnacleError, _> = BarnacleLayer::builder()
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
             .with_store(store)
             .with_config(limit(100))
             .with_state(())
@@ -742,42 +772,28 @@ mod api_keys {
         );
     }
 
-    #[tokio::test]
-    async fn a_missing_validator_state_is_never_counted() {
-        let store = MemoryStore::default();
-        // A validator that needs state, built without one: Barnacle's own misconfiguration
+    #[test]
+    fn a_missing_validator_state_is_a_build_error() {
+        // A validator that needs state, built without one
         let validator =
             |_key: String, _config: ApiKeyConfig, _parts: Arc<Parts>, _state: String| {
                 Box::pin(async move { Ok(()) }) as ValidationFuture
             };
-        let layer: BarnacleLayer<(), MemoryStore, String, BarnacleError, _> =
-            BarnacleLayer::builder()
-                .with_store(store.clone())
-                .with_config(limit(100))
-                .with_api_key_validator(validator)
-                .with_failed_validation_limit(limit(3))
-                .build()
-                .unwrap();
-        let app = Router::new()
-            .route("/", get(|| async { "ok" }))
-            .route_layer(layer);
-
-        let response = send(&app, keyed("some-key", "1.1.1.1:1")).await;
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            store.count(
-                BarnacleKey::Ip("1.1.1.1".into()),
-                FAILED_VALIDATION_SCOPE,
-                ANY_METHOD
-            ),
-            0
-        );
+        let layer = BarnacleLayer::<MemoryStore, String>::builder()
+            .with_store(MemoryStore::default())
+            .with_config(limit(100))
+            .with_api_key_validator(validator)
+            .build();
+        assert!(matches!(
+            layer,
+            Err(BarnacleLayerBuilderError::MissingState)
+        ));
     }
 
     #[tokio::test]
     async fn api_key_header_is_ignored_without_a_validator() {
         let store = MemoryStore::default();
-        let layer: BarnacleLayer<(), MemoryStore> = BarnacleLayer::builder()
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
             .with_store(store.clone())
             .with_config(limit(2))
             .build()
@@ -810,7 +826,7 @@ mod store_failures {
     use super::*;
 
     fn app(store: BrokenStore, policy: StoreFailurePolicy) -> Router {
-        let layer: BarnacleLayer<(), BrokenStore> = BarnacleLayer::builder()
+        let layer: BarnacleLayer<BrokenStore> = BarnacleLayer::builder()
             .with_store(store)
             .with_config(limit(10))
             .with_store_failure_policy(policy)
@@ -869,9 +885,10 @@ mod responses {
 
     #[tokio::test]
     async fn rate_limit_headers_survive_custom_error_types() {
-        let layer: BarnacleLayer<(), MemoryStore, (), AppError> = BarnacleLayer::builder()
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
             .with_store(MemoryStore::default())
             .with_config(limit(1))
+            .with_error::<AppError>()
             .build()
             .unwrap();
         let app = Router::new()
@@ -897,10 +914,10 @@ mod responses {
         .await;
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
         let headers = second.headers();
-        assert_eq!(headers["retry-after"], "42");
+        assert_eq!(headers["retry-after"], "60");
         assert_eq!(headers["x-ratelimit-limit"], "1");
         assert_eq!(headers["x-ratelimit-remaining"], "0");
-        assert_eq!(headers["x-ratelimit-reset"], "42");
+        assert_eq!(headers["x-ratelimit-reset"], "60");
     }
 
     #[tokio::test]
@@ -925,9 +942,10 @@ mod payload {
     }
 
     fn app(store: MemoryStore) -> Router {
-        let layer: BarnacleLayer<Login, MemoryStore> = BarnacleLayer::builder()
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
             .with_store(store)
             .with_config(limit(10))
+            .with_payload_key::<Login>()
             .with_max_body_size(64)
             .build()
             .unwrap();
@@ -979,7 +997,7 @@ mod payload {
 
     #[tokio::test]
     async fn bodies_are_not_buffered_when_the_key_is_not_in_the_payload() {
-        let layer: BarnacleLayer<(), MemoryStore> = BarnacleLayer::builder()
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
             .with_store(MemoryStore::default())
             .with_config(limit(10))
             .with_max_body_size(8)
@@ -998,5 +1016,912 @@ mod payload {
         let response = send(&app, with_peer(req, "1.1.1.1:1")).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_text(response).await, "1000");
+    }
+}
+
+/// The principal an application's authentication middleware stores in the extensions
+#[derive(Clone)]
+struct Principal {
+    credential: String,
+    tier: &'static str,
+}
+
+/// Authentication middleware: reads `x-credential: <id>:<tier>` into a [`Principal`]
+async fn authenticate(mut req: Request<Body>, next: axum::middleware::Next) -> Response {
+    let principal = req
+        .headers()
+        .get("x-credential")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(':'))
+        .map(|(credential, tier)| Principal {
+            credential: credential.to_string(),
+            tier: match tier {
+                "gold" => "gold",
+                "internal" => "internal",
+                _ => "free",
+            },
+        });
+    if let Some(principal) = principal {
+        req.extensions_mut().insert(principal);
+    }
+    next.run(req).await
+}
+
+fn tier_limits(tier: &str) -> Vec<Limit> {
+    match tier {
+        "gold" => vec![Limit::new(3, Duration::from_secs(60))],
+        // Exempt, e.g. an internal worker
+        "internal" => vec![],
+        _ => vec![Limit::new(1, Duration::from_secs(60))],
+    }
+}
+
+fn identify(parts: &Parts, _state: &()) -> Option<Identity> {
+    let principal = parts.extensions.get::<Principal>()?;
+    Some(
+        Identity::new(BarnacleKey::Custom(principal.credential.clone()))
+            .with_limits(tier_limits(principal.tier)),
+    )
+}
+
+fn credential(credential: &str, peer: &str) -> Request<Body> {
+    with_peer(
+        request("GET", "/a")
+            .header("x-credential", credential)
+            .body(Body::empty())
+            .unwrap(),
+        peer,
+    )
+}
+
+async fn statuses(app: &Router, requests: impl IntoIterator<Item = Request<Body>>) -> Vec<u16> {
+    let mut statuses = vec![];
+    for req in requests {
+        statuses.push(send(app, req).await.status().as_u16());
+    }
+    statuses
+}
+
+mod identity {
+    use super::*;
+
+    fn app(store: MemoryStore) -> Router {
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
+            .with_store(store)
+            .with_config(limit(2))
+            .with_scope(RateLimitScope::Named("public-api".into()))
+            .with_identifier(identify)
+            .build()
+            .unwrap();
+        Router::new()
+            .route("/a", get(|| async { "ok" }))
+            .route_layer(layer)
+            .layer(axum::middleware::from_fn(authenticate))
+    }
+
+    #[tokio::test]
+    async fn principals_are_counted_with_their_tier_limits() {
+        let store = MemoryStore::default();
+        let app = app(store.clone());
+
+        // Same client IP, different credentials: separate buckets and limits
+        let gold = statuses(
+            &app,
+            (0..4).map(|_| credential("cred-gold:gold", "1.1.1.1:1")),
+        )
+        .await;
+        assert_eq!(gold, [200, 200, 200, 429]);
+        let free = statuses(
+            &app,
+            (0..2).map(|_| credential("cred-free:free", "1.1.1.1:1")),
+        )
+        .await;
+        assert_eq!(free, [200, 429]);
+
+        assert_eq!(
+            store.count(
+                BarnacleKey::Custom("cred-gold".into()),
+                "public-api",
+                ANY_METHOD
+            ),
+            3
+        );
+        assert_eq!(
+            store.count(
+                BarnacleKey::Custom("cred-free".into()),
+                "public-api",
+                ANY_METHOD
+            ),
+            1
+        );
+        // Nothing was counted for the IP they share
+        assert_eq!(
+            store.count(BarnacleKey::Ip("1.1.1.1".into()), "public-api", ANY_METHOD),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn the_limit_header_reports_the_tier_limit() {
+        let app = app(MemoryStore::default());
+        let response = send(&app, credential("cred-gold:gold", "1.1.1.1:1")).await;
+        assert_eq!(response.headers()["x-ratelimit-limit"], "3");
+        assert_eq!(response.headers()["x-ratelimit-remaining"], "2");
+    }
+
+    #[tokio::test]
+    async fn unidentified_requests_fall_back_to_the_client_ip_and_layer_limits() {
+        let store = MemoryStore::default();
+        let app = app(store.clone());
+        let anonymous = || {
+            with_peer(
+                request("GET", "/a").body(Body::empty()).unwrap(),
+                "1.1.1.1:1",
+            )
+        };
+        assert_eq!(
+            statuses(&app, (0..3).map(|_| anonymous())).await,
+            [200, 200, 429]
+        );
+        assert_eq!(
+            store.count(BarnacleKey::Ip("1.1.1.1".into()), "public-api", ANY_METHOD),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn identities_without_limits_are_not_counted() {
+        let store = MemoryStore::default();
+        let app = app(store.clone());
+        let internal = statuses(
+            &app,
+            (0..5).map(|_| credential("worker:internal", "1.1.1.1:1")),
+        )
+        .await;
+        assert_eq!(internal, [200; 5]);
+        assert!(store.keys().is_empty());
+        let response = send(&app, credential("worker:internal", "1.1.1.1:1")).await;
+        assert!(!response.headers().contains_key("x-ratelimit-limit"));
+    }
+
+    /// Resolver that looks the tier up asynchronously, from the layer state
+    struct TierLookup;
+
+    #[async_trait::async_trait]
+    impl IdentityResolver<Arc<HashMap<String, &'static str>>> for TierLookup {
+        async fn identify(
+            &self,
+            parts: &Parts,
+            tiers: &Arc<HashMap<String, &'static str>>,
+        ) -> Option<Identity> {
+            let principal = parts.extensions.get::<Principal>()?;
+            tokio::task::yield_now().await;
+            let tier = tiers.get(&principal.credential).copied().unwrap_or("free");
+            Some(
+                Identity::new(BarnacleKey::Custom(principal.credential.clone()))
+                    .with_limits(tier_limits(tier)),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_resolvers_can_be_asynchronous_and_use_the_state() {
+        let tiers = Arc::new(HashMap::from([("cred-1".to_string(), "gold")]));
+        let layer: BarnacleLayer<MemoryStore, _> = BarnacleLayer::builder()
+            .with_store(MemoryStore::default())
+            .with_config(limit(1))
+            .with_state(tiers)
+            .with_identity_resolver(TierLookup)
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route("/a", get(|| async { "ok" }))
+            .route_layer(layer)
+            .layer(axum::middleware::from_fn(authenticate));
+        // The header claims "free", the state says gold
+        let gold = statuses(&app, (0..4).map(|_| credential("cred-1:free", "1.1.1.1:1"))).await;
+        assert_eq!(gold, [200, 200, 200, 429]);
+    }
+}
+
+mod multiple_limits {
+    use super::*;
+
+    /// A global limit per client and a stricter one per route
+    fn app(store: MemoryStore) -> Router {
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
+            .with_store(store)
+            .with_limits([
+                Limit::new(5, Duration::from_secs(60))
+                    .with_scope(RateLimitScope::Named("global".into())),
+                Limit::new(2, Duration::from_secs(10)).with_scope(RateLimitScope::Route),
+            ])
+            .build()
+            .unwrap();
+        Router::new()
+            .route("/a", get(|| async { "ok" }))
+            .route("/b", get(|| async { "ok" }))
+            .route("/c", get(|| async { "ok" }))
+            .route_layer(layer)
+    }
+
+    fn call(path: &str) -> Request<Body> {
+        with_peer(
+            request("GET", path).body(Body::empty()).unwrap(),
+            "1.1.1.1:1",
+        )
+    }
+
+    #[tokio::test]
+    async fn a_rejected_request_consumes_no_limit() {
+        let store = MemoryStore::default();
+        let app = app(store.clone());
+        let ip = || BarnacleKey::Ip("1.1.1.1".into());
+
+        assert_eq!(
+            statuses(&app, (0..4).map(|_| call("/a"))).await,
+            [200, 200, 429, 429]
+        );
+        // The two rejections did not consume the global limit
+        assert_eq!(store.count(ip(), "global", ANY_METHOD), 2);
+        assert_eq!(store.count(ip(), "/a", "GET"), 2);
+
+        // The global limit still has room for three requests, whatever the route
+        assert_eq!(
+            statuses(&app, (0..3).map(|_| call("/b"))).await,
+            [200, 200, 429]
+        );
+        assert_eq!(store.count(ip(), "global", ANY_METHOD), 4);
+    }
+
+    #[tokio::test]
+    async fn the_global_limit_applies_across_routes() {
+        let store = MemoryStore::default();
+        let app = app(store.clone());
+        let calls = ["/a", "/b", "/c", "/a", "/b", "/c"].map(call);
+        // The sixth request is within its route limit but over the global one
+        assert_eq!(statuses(&app, calls).await, [200, 200, 200, 200, 200, 429]);
+    }
+
+    #[tokio::test]
+    async fn headers_report_the_strictest_limit() {
+        let app = app(MemoryStore::default());
+
+        let first = send(&app, call("/a")).await;
+        assert_eq!(first.headers()["x-ratelimit-limit"], "2");
+        assert_eq!(first.headers()["x-ratelimit-remaining"], "1");
+        assert_eq!(first.headers()["x-ratelimit-reset"], "10");
+
+        send(&app, call("/a")).await;
+        let rejected = send(&app, call("/a")).await;
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejected.headers()["x-ratelimit-limit"], "2");
+        assert_eq!(rejected.headers()["x-ratelimit-remaining"], "0");
+        assert_eq!(rejected.headers()["retry-after"], "10");
+
+        let other = send(&app, call("/b")).await;
+        assert_eq!(other.headers()["x-ratelimit-limit"], "2");
+        assert_eq!(other.headers()["x-ratelimit-remaining"], "1");
+
+        // One request left on both: the global limit, which resets later, is reported
+        let last = send(&app, call("/c")).await;
+        assert_eq!(last.headers()["x-ratelimit-limit"], "5");
+        assert_eq!(last.headers()["x-ratelimit-remaining"], "1");
+        assert_eq!(last.headers()["x-ratelimit-reset"], "60");
+    }
+
+    #[tokio::test]
+    async fn burst_and_sustained_limits_on_named_buckets() {
+        let store = MemoryStore::default();
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
+            .with_store(store.clone())
+            .with_scope(RateLimitScope::Named("api".into()))
+            .with_limits([
+                Limit::new(2, Duration::from_secs(1))
+                    .with_scope(RateLimitScope::Named("api:burst".into())),
+                Limit::new(600, Duration::from_secs(60)),
+            ])
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route("/a", get(|| async { "ok" }))
+            .route_layer(layer);
+        assert_eq!(
+            statuses(&app, (0..3).map(|_| call("/a"))).await,
+            [200, 200, 429]
+        );
+        let ip = BarnacleKey::Ip("1.1.1.1".into());
+        assert_eq!(store.count(ip.clone(), "api:burst", ANY_METHOD), 2);
+        assert_eq!(store.count(ip, "api", ANY_METHOD), 2);
+    }
+
+    #[test]
+    fn limits_sharing_a_bucket_are_a_build_error() {
+        // The second limit has no scope of its own: it counts the layer's scope too
+        let layer = BarnacleLayer::<MemoryStore>::builder()
+            .with_store(MemoryStore::default())
+            .with_limits([
+                Limit::new(20, Duration::from_secs(1)).with_scope(RateLimitScope::Path),
+                Limit::new(600, Duration::from_secs(60)),
+            ])
+            .build();
+        assert!(matches!(
+            layer,
+            Err(BarnacleLayerBuilderError::DuplicateLimitScope(_))
+        ));
+    }
+
+    #[test]
+    fn path_and_route_limits_are_a_build_error() {
+        // On a route without parameters both count the concrete path
+        let layer = BarnacleLayer::<MemoryStore>::builder()
+            .with_store(MemoryStore::default())
+            .with_limits([
+                Limit::new(20, Duration::from_secs(1)).with_scope(RateLimitScope::Path),
+                Limit::new(600, Duration::from_secs(60)).with_scope(RateLimitScope::Route),
+            ])
+            .build();
+        assert!(matches!(
+            layer,
+            Err(BarnacleLayerBuilderError::DuplicateLimitScope(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn colliding_identity_limits_go_through_uncounted_in_shadow_mode() {
+        let store = MemoryStore::default();
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
+            .with_store(store.clone())
+            .with_config(limit(10))
+            .with_mode(Mode::Shadow)
+            .with_identifier(|_parts: &Parts, _state: &()| {
+                Some(Identity::new(BarnacleKey::Custom("c".into())).with_limits([
+                    Limit::new(1, Duration::from_secs(1)).with_scope(RateLimitScope::Path),
+                    Limit::new(2, Duration::from_secs(60)).with_scope(RateLimitScope::Route),
+                ]))
+            })
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route("/a", get(|| async { "ok" }))
+            .route_layer(layer);
+        assert_eq!(send(&app, call("/a")).await.status(), StatusCode::OK);
+        assert!(store.keys().is_empty());
+    }
+
+    #[tokio::test]
+    async fn identity_limits_sharing_a_bucket_are_a_server_error() {
+        let store = MemoryStore::default();
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
+            .with_store(store.clone())
+            .with_config(limit(10))
+            .with_identifier(|_parts: &Parts, _state: &()| {
+                Some(Identity::new(BarnacleKey::Custom("c".into())).with_limits([
+                    Limit::new(1, Duration::from_secs(1)),
+                    Limit::new(2, Duration::from_secs(60)),
+                ]))
+            })
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route("/a", get(|| async { "ok" }))
+            .route_layer(layer);
+        assert_eq!(
+            send(&app, call("/a")).await.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(store.keys().is_empty());
+    }
+
+    /// A custom store that only implements `increment`
+    #[derive(Clone, Default)]
+    struct IncrementOnlyStore(MemoryStore);
+
+    #[async_trait::async_trait]
+    impl BarnacleStore for IncrementOnlyStore {
+        async fn increment(
+            &self,
+            context: &BarnacleContext,
+            config: &BarnacleConfig,
+        ) -> Result<BarnacleResult, BarnacleError> {
+            self.0.increment(context, config).await
+        }
+
+        async fn reset(&self, context: &BarnacleContext) -> Result<(), BarnacleError> {
+            self.0.reset(context).await
+        }
+    }
+
+    #[tokio::test]
+    async fn stores_without_increment_all_support_a_single_limit_only() {
+        let single: BarnacleLayer<IncrementOnlyStore> = BarnacleLayer::builder()
+            .with_store(IncrementOnlyStore::default())
+            .with_config(limit(1))
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route("/a", get(|| async { "ok" }))
+            .route_layer(single);
+        let rejected = statuses(&app, (0..2).map(|_| call("/a"))).await;
+        assert_eq!(rejected, [200, 429]);
+
+        let multiple: BarnacleLayer<IncrementOnlyStore> = BarnacleLayer::builder()
+            .with_store(IncrementOnlyStore::default())
+            .with_limits([
+                Limit::new(5, Duration::from_secs(60)),
+                Limit::new(5, Duration::from_secs(60))
+                    .with_scope(RateLimitScope::Named("global".into())),
+            ])
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route("/a", get(|| async { "ok" }))
+            .route_layer(multiple);
+        // Counting the limits one by one would not be atomic: it is a store failure
+        assert_eq!(
+            send(&app, call("/a")).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+}
+
+mod shadow {
+    use super::*;
+
+    fn recorder() -> (
+        Arc<Mutex<Vec<RateLimitDecision>>>,
+        impl Fn(&RateLimitDecision) + Send + Sync + 'static,
+    ) {
+        let decisions = Arc::new(Mutex::new(vec![]));
+        let recorded = decisions.clone();
+        (decisions, move |decision: &RateLimitDecision| {
+            recorded.lock().unwrap().push(decision.clone())
+        })
+    }
+
+    fn call() -> Request<Body> {
+        with_peer(
+            request("GET", "/a").body(Body::empty()).unwrap(),
+            "1.1.1.1:1",
+        )
+    }
+
+    fn outcomes(decisions: &Mutex<Vec<RateLimitDecision>>) -> Vec<DecisionOutcome> {
+        decisions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|decision| decision.outcome)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn shadow_mode_counts_and_reports_but_never_rejects() {
+        let store = MemoryStore::default();
+        let (decisions, hook) = recorder();
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
+            .with_store(store.clone())
+            .with_config(limit(1))
+            .with_mode(Mode::Shadow)
+            .on_decision(hook)
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route("/a", get(|| async { "ok" }))
+            .route_layer(layer);
+
+        let first = send(&app, call()).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()["x-ratelimit-remaining"], "0");
+        let second = send(&app, call()).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(second.headers()["x-ratelimit-limit"], "1");
+        assert_eq!(second.headers()["x-ratelimit-remaining"], "0");
+
+        // Counted as enforcing would: the request that would be rejected is not counted
+        assert_eq!(
+            store.count(BarnacleKey::Ip("1.1.1.1".into()), "/a", "GET"),
+            1
+        );
+        assert_eq!(
+            outcomes(&decisions),
+            [DecisionOutcome::Allowed, DecisionOutcome::WouldReject]
+        );
+        let decisions = decisions.lock().unwrap();
+        let would_reject = &decisions[1];
+        assert_eq!(would_reject.mode, Mode::Shadow);
+        assert_eq!(would_reject.key_kind, "ip");
+        assert_eq!(would_reject.limits.len(), 1);
+        assert!(would_reject.limits[0].exceeded);
+        assert_eq!(would_reject.limits[0].remaining, 0);
+        assert_eq!(would_reject.limits[0].scope, RateLimitScope::Path);
+    }
+
+    #[tokio::test]
+    async fn requests_over_the_limit_do_not_reset_counters_in_shadow_mode() {
+        let store = MemoryStore::default();
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
+            .with_store(store.clone())
+            .with_config(BarnacleConfig {
+                max_requests: 1,
+                window: Duration::from_secs(60),
+                reset_on_success: ResetOnSuccess::Yes(Some(vec![201])),
+            })
+            .with_mode(Mode::Shadow)
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route("/a", get(|| async { "ok" }))
+            .route("/login", get(|| async { StatusCode::CREATED }))
+            .route_layer(layer);
+        let login = || {
+            with_peer(
+                request("GET", "/login").body(Body::empty()).unwrap(),
+                "1.1.1.1:1",
+            )
+        };
+        let ip = || BarnacleKey::Ip("1.1.1.1".into());
+
+        // A successful request within the limit resets its counter, as when enforcing
+        assert_eq!(send(&app, login()).await.status(), StatusCode::CREATED);
+        assert_eq!(store.count(ip(), "/login", "GET"), 0);
+
+        // Fill the bucket with a request that doesn't reset it, then succeed over it:
+        // enforcing would have rejected that one, so the counter must stay full
+        let app_fill = Router::new()
+            .route("/login", get(|| async { "ok" }))
+            .route_layer(
+                BarnacleLayer::<MemoryStore>::builder()
+                    .with_store(store.clone())
+                    .with_config(limit(1))
+                    .build()
+                    .unwrap(),
+            );
+        send(&app_fill, login()).await;
+        assert_eq!(store.count(ip(), "/login", "GET"), 1);
+        assert_eq!(send(&app, login()).await.status(), StatusCode::CREATED);
+        assert_eq!(store.count(ip(), "/login", "GET"), 1);
+    }
+
+    #[tokio::test]
+    async fn shadow_mode_lets_requests_through_when_the_store_is_down() {
+        let (decisions, hook) = recorder();
+        let layer: BarnacleLayer<BrokenStore> = BarnacleLayer::builder()
+            .with_store(BrokenStore { delay: None })
+            .with_config(limit(1))
+            .with_store_failure_policy(StoreFailurePolicy::FailClosed)
+            .with_mode(Mode::Shadow)
+            .on_decision(hook)
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route("/a", get(|| async { "ok" }))
+            .route_layer(layer);
+        assert_eq!(send(&app, call()).await.status(), StatusCode::OK);
+        assert_eq!(outcomes(&decisions), [DecisionOutcome::StoreFailure]);
+    }
+
+    #[tokio::test]
+    async fn shadow_mode_does_not_reject_failed_validations() {
+        let store = MemoryStore::default();
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
+            .with_store(store)
+            .with_config(limit(100))
+            .with_api_key_validator(validator())
+            .with_failed_validation_limit(limit(1))
+            .with_mode(Mode::Shadow)
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route("/a", get(|| async { "ok" }))
+            .route_layer(layer);
+        let keyed = |key: &str| {
+            with_peer(
+                request("GET", "/a")
+                    .header("x-api-key", key)
+                    .body(Body::empty())
+                    .unwrap(),
+                "1.1.1.1:1",
+            )
+        };
+        let attempts = statuses(&app, ["guess-1", "guess-2", VALID_KEY].map(keyed)).await;
+        assert_eq!(attempts, [401, 401, 200]);
+    }
+
+    fn keyed_call(key: &str) -> Request<Body> {
+        with_peer(
+            request("GET", "/a")
+                .header("x-api-key", key)
+                .body(Body::empty())
+                .unwrap(),
+            "1.1.1.1:1",
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_validation_decisions_are_reported_once_per_limit() {
+        for mode in [Mode::Enforce, Mode::Shadow] {
+            let (decisions, hook) = recorder();
+            let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
+                .with_store(MemoryStore::default())
+                .with_config(limit(100))
+                .with_api_key_validator(validator())
+                .with_failed_validation_limit(limit(1))
+                .with_mode(mode)
+                .on_decision(hook)
+                .build()
+                .unwrap();
+            let app = Router::new()
+                .route("/a", get(|| async { "ok" }))
+                .route_layer(layer);
+
+            // A successful precheck does not count a failed validation or emit an event.
+            assert_eq!(
+                send(&app, keyed_call(VALID_KEY)).await.status(),
+                StatusCode::OK
+            );
+            assert_eq!(outcomes(&decisions), [DecisionOutcome::Allowed]);
+            assert_eq!(decisions.lock().unwrap()[0].key_kind, "api_key");
+            decisions.lock().unwrap().clear();
+
+            let attempts = statuses(&app, ["guess-1", "guess-2", VALID_KEY].map(keyed_call)).await;
+            let rejected = if mode == Mode::Enforce {
+                assert_eq!(attempts, [401, 429, 429]);
+                DecisionOutcome::Rejected
+            } else {
+                assert_eq!(attempts, [401, 401, 200]);
+                DecisionOutcome::WouldReject
+            };
+            let mut expected = vec![DecisionOutcome::Allowed, rejected, rejected];
+            if mode == Mode::Shadow {
+                // The valid key also reaches the regular request limit after the bypass.
+                expected.push(DecisionOutcome::Allowed);
+            }
+            assert_eq!(outcomes(&decisions), expected);
+            let recorded = decisions.lock().unwrap();
+            for (index, decision) in recorded[..3].iter().enumerate() {
+                assert_eq!(decision.mode, mode);
+                assert_eq!(decision.key_kind, "ip");
+                assert_eq!(
+                    decision.key_hash,
+                    BarnacleKey::Ip("1.1.1.1".into()).hashed()
+                );
+                assert_eq!(decision.limits.len(), 1);
+                let limit = &decision.limits[0];
+                assert_eq!(
+                    limit.scope,
+                    RateLimitScope::Named(FAILED_VALIDATION_SCOPE.into())
+                );
+                assert_eq!(limit.bucket, FAILED_VALIDATION_SCOPE);
+                assert_eq!(limit.max_requests, 1);
+                assert_eq!(limit.window, Duration::from_secs(60));
+                assert_eq!(limit.reset_after, Duration::from_secs(42));
+                assert_eq!(limit.remaining, 0);
+                assert_eq!(limit.exceeded, index > 0);
+            }
+            if mode == Mode::Shadow {
+                assert_eq!(recorded[3].key_kind, "api_key");
+                assert_eq!(recorded[3].limits[0].scope, RateLimitScope::Path);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_validation_rejections_after_the_precheck_are_reported() {
+        for mode in [Mode::Enforce, Mode::Shadow] {
+            let store = MemoryStore::default();
+            let racing_store = store.clone();
+            let (decisions, hook) = recorder();
+            let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
+                .with_store(store)
+                .with_config(limit(100))
+                .with_api_key_validator(
+                    move |key: String, _: ApiKeyConfig, _: Arc<Parts>, _: ()| {
+                        let store = racing_store.clone();
+                        async move {
+                            // Another validation fills the bucket while this validator is running.
+                            store
+                                .increment(
+                                    &BarnacleContext::named(
+                                        BarnacleKey::Ip("1.1.1.1".into()),
+                                        FAILED_VALIDATION_SCOPE,
+                                    ),
+                                    &limit(1),
+                                )
+                                .await
+                                .unwrap();
+                            Err::<(), _>(BarnacleError::invalid_api_key(key))
+                        }
+                    },
+                )
+                .with_failed_validation_limit(limit(1))
+                .with_mode(mode)
+                .on_decision(hook)
+                .build()
+                .unwrap();
+            let app = Router::new()
+                .route("/a", get(|| async { "ok" }))
+                .route_layer(layer);
+            let response = send(&app, keyed_call("guess")).await;
+            if mode == Mode::Enforce {
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(outcomes(&decisions), [DecisionOutcome::Rejected]);
+            } else {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                assert_eq!(outcomes(&decisions), [DecisionOutcome::WouldReject]);
+            }
+            assert!(decisions.lock().unwrap()[0].limits[0].exceeded);
+        }
+    }
+
+    #[derive(Clone)]
+    struct ValidationFailureStore {
+        fail_peek: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl BarnacleStore for ValidationFailureStore {
+        async fn increment(
+            &self,
+            _: &BarnacleContext,
+            _: &BarnacleConfig,
+        ) -> Result<BarnacleResult, BarnacleError> {
+            Err(BarnacleError::store_error("store down"))
+        }
+
+        async fn peek(
+            &self,
+            _: &BarnacleContext,
+            config: &BarnacleConfig,
+        ) -> Result<BarnacleResult, BarnacleError> {
+            if self.fail_peek {
+                Err(BarnacleError::store_error("store down"))
+            } else {
+                Ok(BarnacleResult {
+                    allowed: true,
+                    remaining: config.max_requests,
+                    retry_after: None,
+                })
+            }
+        }
+
+        async fn reset(&self, _: &BarnacleContext) -> Result<(), BarnacleError> {
+            Ok(())
+        }
+    }
+
+    /// Store whose precheck fails while the increment finds the bucket full
+    #[derive(Clone)]
+    struct FullAfterFailedPeekStore;
+
+    #[async_trait::async_trait]
+    impl BarnacleStore for FullAfterFailedPeekStore {
+        async fn increment(
+            &self,
+            _: &BarnacleContext,
+            config: &BarnacleConfig,
+        ) -> Result<BarnacleResult, BarnacleError> {
+            Err(BarnacleError::rate_limit_exceeded(
+                0,
+                42,
+                config.max_requests,
+            ))
+        }
+
+        async fn peek(
+            &self,
+            _: &BarnacleContext,
+            _: &BarnacleConfig,
+        ) -> Result<BarnacleResult, BarnacleError> {
+            Err(BarnacleError::store_error("store down"))
+        }
+
+        async fn reset(&self, _: &BarnacleContext) -> Result<(), BarnacleError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_increment_decides_the_report_after_a_fail_open_precheck() {
+        for mode in [Mode::Enforce, Mode::Shadow] {
+            let (decisions, hook) = recorder();
+            let layer: BarnacleLayer<FullAfterFailedPeekStore> = BarnacleLayer::builder()
+                .with_store(FullAfterFailedPeekStore)
+                .with_config(limit(100))
+                .with_api_key_validator(validator())
+                .with_failed_validation_limit(limit(1))
+                .with_store_failure_policy(StoreFailurePolicy::FailOpen)
+                .with_mode(mode)
+                .on_decision(hook)
+                .build()
+                .unwrap();
+            let app = Router::new()
+                .route("/a", get(|| async { "ok" }))
+                .route_layer(layer);
+            let response = send(&app, keyed_call("guess")).await;
+            let (status, outcome) = match mode {
+                Mode::Enforce => (StatusCode::TOO_MANY_REQUESTS, DecisionOutcome::Rejected),
+                Mode::Shadow => (StatusCode::UNAUTHORIZED, DecisionOutcome::WouldReject),
+            };
+            assert_eq!(response.status(), status);
+            assert_eq!(outcomes(&decisions), [outcome]);
+            assert!(decisions.lock().unwrap()[0].limits[0].exceeded);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_validation_store_failures_are_reported_once() {
+        for fail_peek in [true, false] {
+            for (mode, policy) in [
+                (Mode::Enforce, StoreFailurePolicy::FailClosed),
+                (Mode::Enforce, StoreFailurePolicy::FailOpen),
+                (Mode::Shadow, StoreFailurePolicy::FailClosed),
+            ] {
+                let (decisions, hook) = recorder();
+                let layer: BarnacleLayer<ValidationFailureStore> = BarnacleLayer::builder()
+                    .with_store(ValidationFailureStore { fail_peek })
+                    .with_config(limit(100))
+                    .with_api_key_validator(validator())
+                    .with_failed_validation_limit(limit(1))
+                    .with_mode(mode)
+                    .with_store_failure_policy(policy)
+                    .on_decision(hook)
+                    .build()
+                    .unwrap();
+                let app = Router::new()
+                    .route("/a", get(|| async { "ok" }))
+                    .route_layer(layer);
+                let response = send(&app, keyed_call("guess")).await;
+                let fail_closed =
+                    fail_peek && mode == Mode::Enforce && policy == StoreFailurePolicy::FailClosed;
+                assert_eq!(
+                    response.status(),
+                    if fail_closed {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::UNAUTHORIZED
+                    }
+                );
+                assert_eq!(outcomes(&decisions), [DecisionOutcome::StoreFailure]);
+                let recorded = decisions.lock().unwrap();
+                assert_eq!(recorded[0].mode, mode);
+                assert_eq!(recorded[0].key_kind, "ip");
+                assert_eq!(
+                    recorded[0].key_hash,
+                    BarnacleKey::Ip("1.1.1.1".into()).hashed()
+                );
+                assert!(recorded[0].limits.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_decision_hook_reports_enforced_rejections_with_a_hashed_key() {
+        let (decisions, hook) = recorder();
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
+            .with_store(MemoryStore::default())
+            .with_config(limit(1))
+            .with_identifier(|_parts: &Parts, _state: &()| {
+                Some(Identity::new(BarnacleKey::ApiKey("sk_secret".into())))
+            })
+            .on_decision(hook)
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route("/a", get(|| async { "ok" }))
+            .route_layer(layer);
+        assert_eq!(statuses(&app, [call(), call()]).await, [200, 429]);
+        assert_eq!(
+            outcomes(&decisions),
+            [DecisionOutcome::Allowed, DecisionOutcome::Rejected]
+        );
+        let decisions = decisions.lock().unwrap();
+        assert_eq!(decisions[1].key_kind, "api_key");
+        assert_eq!(
+            decisions[1].key_hash,
+            BarnacleKey::ApiKey("sk_secret".into()).hashed()
+        );
+        assert!(!decisions[1].key_hash.contains("sk_secret"));
+        assert_eq!(decisions[1].limits[0].bucket, "/a");
     }
 }

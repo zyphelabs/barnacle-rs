@@ -7,7 +7,6 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use barnacle_rs::BarnacleError;
 use barnacle_rs::{
     BarnacleConfig, BarnacleContext, BarnacleKey, BarnacleLayer, BarnacleStore, KeyExtractable,
     RedisBarnacleStore, ResetOnSuccess,
@@ -76,24 +75,22 @@ async fn create_test_app() -> (Router, RedisBarnacleStore) {
         reset_on_success: ResetOnSuccess::Not,
     };
 
-    let login_layer: BarnacleLayer<LoginRequest, RedisBarnacleStore, (), BarnacleError, ()> =
-        BarnacleLayer::builder()
-            .with_store(store.clone())
-            .with_config(login_config)
-            .build()
-            .unwrap();
-    let strict_layer: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, ()> =
-        BarnacleLayer::builder()
-            .with_store(store.clone())
-            .with_config(strict_config)
-            .build()
-            .unwrap();
-    let moderate_layer: BarnacleLayer<(), RedisBarnacleStore, (), BarnacleError, ()> =
-        BarnacleLayer::builder()
-            .with_store(store.clone())
-            .with_config(moderate_config)
-            .build()
-            .unwrap();
+    let login_layer: BarnacleLayer<RedisBarnacleStore> = BarnacleLayer::builder()
+        .with_store(store.clone())
+        .with_config(login_config)
+        .with_payload_key::<LoginRequest>()
+        .build()
+        .unwrap();
+    let strict_layer: BarnacleLayer<RedisBarnacleStore> = BarnacleLayer::builder()
+        .with_store(store.clone())
+        .with_config(strict_config)
+        .build()
+        .unwrap();
+    let moderate_layer: BarnacleLayer<RedisBarnacleStore> = BarnacleLayer::builder()
+        .with_store(store.clone())
+        .with_config(moderate_config)
+        .build()
+        .unwrap();
 
     let app = Router::new()
         .route("/api/strict", get(strict_endpoint).layer(strict_layer))
