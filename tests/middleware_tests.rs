@@ -1351,6 +1351,44 @@ mod multiple_limits {
         ));
     }
 
+    #[test]
+    fn path_and_route_limits_are_a_build_error() {
+        // On a route without parameters both count the concrete path
+        let layer = BarnacleLayer::<MemoryStore>::builder()
+            .with_store(MemoryStore::default())
+            .with_limits([
+                Limit::new(20, Duration::from_secs(1)).with_scope(RateLimitScope::Path),
+                Limit::new(600, Duration::from_secs(60)).with_scope(RateLimitScope::Route),
+            ])
+            .build();
+        assert!(matches!(
+            layer,
+            Err(BarnacleLayerBuilderError::DuplicateLimitScope(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn colliding_identity_limits_go_through_uncounted_in_shadow_mode() {
+        let store = MemoryStore::default();
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
+            .with_store(store.clone())
+            .with_config(limit(10))
+            .with_mode(Mode::Shadow)
+            .with_identifier(|_parts: &Parts, _state: &()| {
+                Some(Identity::new(BarnacleKey::Custom("c".into())).with_limits([
+                    Limit::new(1, Duration::from_secs(1)).with_scope(RateLimitScope::Path),
+                    Limit::new(2, Duration::from_secs(60)).with_scope(RateLimitScope::Route),
+                ]))
+            })
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route("/a", get(|| async { "ok" }))
+            .route_layer(layer);
+        assert_eq!(send(&app, call("/a")).await.status(), StatusCode::OK);
+        assert!(store.keys().is_empty());
+    }
+
     #[tokio::test]
     async fn identity_limits_sharing_a_bucket_are_a_server_error() {
         let store = MemoryStore::default();
@@ -1497,6 +1535,52 @@ mod shadow {
         assert!(would_reject.limits[0].exceeded);
         assert_eq!(would_reject.limits[0].remaining, 0);
         assert_eq!(would_reject.limits[0].scope, RateLimitScope::Path);
+    }
+
+    #[tokio::test]
+    async fn requests_over_the_limit_do_not_reset_counters_in_shadow_mode() {
+        let store = MemoryStore::default();
+        let layer: BarnacleLayer<MemoryStore> = BarnacleLayer::builder()
+            .with_store(store.clone())
+            .with_config(BarnacleConfig {
+                max_requests: 1,
+                window: Duration::from_secs(60),
+                reset_on_success: ResetOnSuccess::Yes(Some(vec![201])),
+            })
+            .with_mode(Mode::Shadow)
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route("/a", get(|| async { "ok" }))
+            .route("/login", get(|| async { StatusCode::CREATED }))
+            .route_layer(layer);
+        let login = || {
+            with_peer(
+                request("GET", "/login").body(Body::empty()).unwrap(),
+                "1.1.1.1:1",
+            )
+        };
+        let ip = || BarnacleKey::Ip("1.1.1.1".into());
+
+        // A successful request within the limit resets its counter, as when enforcing
+        assert_eq!(send(&app, login()).await.status(), StatusCode::CREATED);
+        assert_eq!(store.count(ip(), "/login", "GET"), 0);
+
+        // Fill the bucket with a request that doesn't reset it, then succeed over it:
+        // enforcing would have rejected that one, so the counter must stay full
+        let app_fill = Router::new()
+            .route("/login", get(|| async { "ok" }))
+            .route_layer(
+                BarnacleLayer::<MemoryStore>::builder()
+                    .with_store(store.clone())
+                    .with_config(limit(1))
+                    .build()
+                    .unwrap(),
+            );
+        send(&app_fill, login()).await;
+        assert_eq!(store.count(ip(), "/login", "GET"), 1);
+        assert_eq!(send(&app, login()).await.status(), StatusCode::CREATED);
+        assert_eq!(store.count(ip(), "/login", "GET"), 1);
     }
 
     #[tokio::test]

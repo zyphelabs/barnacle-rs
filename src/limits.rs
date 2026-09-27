@@ -11,7 +11,8 @@ use crate::types::{BarnacleConfig, BarnacleContext, BarnacleKey, RateLimitScope}
 /// counters is incremented.
 ///
 /// Every limit of a request must count a different bucket, i.e. have a different scope:
-/// two limits on the same scope would share one counter. To combine a burst and a
+/// two limits on the same scope would share one counter. `Path` and `Route` count the
+/// same counter on routes without parameters, so they can't be combined either. To combine a burst and a
 /// sustained limit on the same routes, name them differently, e.g.
 /// `Named("api:burst")` and `Named("api")`.
 #[derive(Clone, Debug, PartialEq, Eq)]

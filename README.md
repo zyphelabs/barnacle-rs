@@ -499,13 +499,16 @@ let layer: BarnacleLayer<RedisBarnacleStore> = BarnacleLayer::builder()
 
 - A limit without a scope uses the layer's scope (`with_scope`).
 - Every limit must count a different bucket, so each needs its own scope: two limits on the
-  same scope would share one counter. `build` rejects this with `DuplicateLimitScope`; limits
-  coming from an identity are checked per request and answered with 500. To combine a burst
+  same scope would share one counter. `Path` and `Route` can't be combined either: on a route
+  without parameters they count the same counter. `build` rejects this with
+  `DuplicateLimitScope`; limits coming from an identity are checked per request and answered
+  with 500 (in shadow mode the request goes through uncounted). To combine a burst
   and a sustained limit on the same routes, give them different `Named` scopes as above.
 - The response headers report the strictest limit: over the limit, the exceeded limit that
   resets last (its reset is the `Retry-After`); otherwise the limit with the fewest requests
   left, the one resetting last on a tie.
-- `ResetOnSuccess` resets every counter of the request.
+- `ResetOnSuccess` resets every counter of the request. In shadow mode, a request over a
+  limit never resets them, since enforcing would have rejected it.
 - Windows are counted in whole seconds, as before.
 - The keys of a request are passed to one script, so they must live in the same hash slot:
   Redis Cluster is not supported.

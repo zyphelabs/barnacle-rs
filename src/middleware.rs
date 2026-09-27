@@ -123,7 +123,7 @@ pub enum BarnacleLayerBuilderError {
         "The API key validator, request modifier or identifier needs a state: use `with_state`"
     )]
     MissingState,
-    #[error("Two limits count the same bucket ({0}): give each limit its own scope")]
+    #[error("Two limits can count the same bucket ({0}): give each limit its own scope")]
     DuplicateLimitScope(String),
 }
 
@@ -352,16 +352,8 @@ where
         settings.limits = self
             .limits
             .ok_or(BarnacleLayerBuilderError::MissingConfig)?;
-        for (index, limit) in settings.limits.iter().enumerate() {
-            let scope = settings.scope_of(limit);
-            if settings.limits[..index]
-                .iter()
-                .any(|other| settings.scope_of(other) == scope)
-            {
-                return Err(BarnacleLayerBuilderError::DuplicateLimitScope(format!(
-                    "{scope:?}"
-                )));
-            }
+        if let Some(collision) = settings.colliding_scopes(&settings.limits) {
+            return Err(BarnacleLayerBuilderError::DuplicateLimitScope(collision));
         }
         if self.api_key_validator.is_some()
             || self.request_modifier.is_some()
@@ -666,6 +658,27 @@ impl<State> Settings<State> {
         limit.scope.as_ref().unwrap_or(&self.scope)
     }
 
+    /// Two limits whose scopes can count the same bucket, described for an error.
+    ///
+    /// Besides equal scopes, `Path` and `Route` collide: on a route without parameters
+    /// the route template is the concrete path, so both count one counter.
+    fn colliding_scopes(&self, limits: &[Limit]) -> Option<String> {
+        let collide = |a: &RateLimitScope, b: &RateLimitScope| match (a, b) {
+            (RateLimitScope::Named(a), RateLimitScope::Named(b)) => a == b,
+            (RateLimitScope::Named(_), _) | (_, RateLimitScope::Named(_)) => false,
+            // Path and Route, in any combination
+            _ => true,
+        };
+        limits.iter().enumerate().find_map(|(index, limit)| {
+            let scope = self.scope_of(limit);
+            limits[..index]
+                .iter()
+                .map(|other| self.scope_of(other))
+                .find(|other| collide(other, scope))
+                .map(|other| format!("{other:?} and {scope:?}"))
+        })
+    }
+
     /// Response for a failed store operation, or `None` when the request goes through
     /// anyway: with [`StoreFailurePolicy::FailOpen`], or in [`Mode::Shadow`].
     fn store_failure(&self, error: BarnacleError) -> Option<Response<Body>> {
@@ -732,23 +745,23 @@ impl<State> Settings<State> {
         parts: &Parts,
         current_path: &str,
     ) -> Result<Vec<Bucket>, BarnacleError> {
-        let mut buckets: Vec<Bucket> = Vec::with_capacity(limits.len());
-        for limit in limits {
-            let context = self.context(self.scope_of(limit), key.clone(), parts, current_path);
-            // Counting one counter twice in the same script would double count it
-            if buckets.iter().any(|bucket| bucket.context == context) {
-                return Err(BarnacleError::configuration_error(format!(
-                    "Two limits count the same bucket ({} {}): give each limit its own scope",
-                    context.method, context.path
-                )));
-            }
-            buckets.push(Bucket {
-                context,
+        // Counting one counter twice in the same script would double count it. The layer's
+        // limits were checked by `build`, an identity's are checked here, on the scopes
+        // rather than the contexts so that the answer doesn't depend on the route.
+        if let Some(collision) = self.colliding_scopes(limits) {
+            return Err(BarnacleError::configuration_error(format!(
+                "Two limits can count the same bucket ({collision}): give each limit its own \
+                 scope; Path and Route share a bucket on routes without parameters"
+            )));
+        }
+        Ok(limits
+            .iter()
+            .map(|limit| Bucket {
+                context: self.context(self.scope_of(limit), key.clone(), parts, current_path),
                 max_requests: limit.max_requests,
                 window: limit.window,
-            });
-        }
-        Ok(buckets)
+            })
+            .collect())
     }
 }
 
@@ -1088,6 +1101,11 @@ where
 
         let buckets = match self.buckets(&key, &limits, &parts, &current_path) {
             Ok(buckets) => buckets,
+            // Shadow mode never rejects: the request goes through uncounted
+            Err(error) if self.mode == Mode::Shadow => {
+                warn!("{}, letting the request through uncounted", error);
+                Vec::new()
+            }
             Err(error) => {
                 warn!("{}", error);
                 return Ok((self.error_response)(error));
@@ -1116,8 +1134,12 @@ where
                 &states[index],
             );
         }
-        self.reset_counters(&store, &key, &buckets, response.status().as_u16())
-            .await;
+        // A request over a limit only gets here in shadow mode: enforcing would have
+        // rejected it before the handler, so it must not reset the counters either
+        if !states.iter().any(|state| state.exceeded) {
+            self.reset_counters(&store, &key, &buckets, response.status().as_u16())
+                .await;
+        }
         Ok(response)
     }
 }
