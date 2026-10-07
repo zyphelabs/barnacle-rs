@@ -599,14 +599,16 @@ Barnacle automatically includes route information (path and method) in Redis key
 **Redis Key Format:**
 
 ```
-barnacle:email:user@example.com:POST:/auth/login
-barnacle:email:user@example.com:POST:/auth/start-reset
+barnacle:email:<sha256 of the address>:POST:/auth/login
+barnacle:email:<sha256 of the address>:POST:/auth/start-reset
 barnacle:api_keys:<sha256 of the key>:GET:/api/data
 barnacle:ip:192.168.1.1:POST:/api/submit
 ```
 
-API keys are stored as their SHA-256 hash and are redacted in logs and in `BarnacleKey`'s
-`Debug` output.
+API keys and email addresses are stored as their SHA-256 hash and are redacted in logs and
+in `BarnacleKey`'s `Debug` output. The hash keeps the address out of Redis and the logs; it
+does not make it unrecoverable, since anyone holding a list of addresses can hash them and
+compare.
 
 This means:
 

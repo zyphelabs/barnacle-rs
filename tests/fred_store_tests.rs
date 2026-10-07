@@ -176,6 +176,41 @@ async fn api_keys_are_not_stored_in_clear_text() {
 }
 
 #[tokio::test]
+async fn emails_are_not_stored_in_clear_text() {
+    let store = store().await;
+    let email = format!("{}@example.com", Uuid::new_v4());
+    let context = BarnacleContext {
+        key: BarnacleKey::Email(email.clone()),
+        path: "/test".into(),
+        method: "POST".into(),
+    };
+    store.increment(&context, &limit(5, 30)).await.unwrap();
+
+    let keys = |pattern: String| {
+        let store = store.clone();
+        async move {
+            store
+                .pool()
+                .custom::<Vec<String>, _>(
+                    CustomCommand::new_static("KEYS", None, false),
+                    vec![pattern],
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let clear = keys(format!("*{email}*")).await;
+    assert!(clear.is_empty(), "found {clear:?}");
+    let hashed = keys(format!(
+        "barnacle:email:{}:POST:/test",
+        hash_api_key(&email)
+    ))
+    .await;
+    assert_eq!(hashed.len(), 1);
+    store.reset(&context).await.unwrap();
+}
+
+#[tokio::test]
 async fn unreachable_redis_fails_fast() {
     let started = std::time::Instant::now();
     let store = FredBarnacleStore::from_url_with_options(

@@ -78,8 +78,10 @@ return {current, ttl}
 /// The Redis key of the counter for `context`.
 pub(crate) fn counter_key(context: &BarnacleContext) -> String {
     let base_key = match &context.key {
-        BarnacleKey::Email(email) => format!("{BARNACLE_EMAIL_KEY_PREFIX}:{}", email),
-        // API keys are hashed so they are never stored in clear text
+        // Email addresses and API keys are hashed so they are never stored in clear text
+        BarnacleKey::Email(email) => {
+            format!("{BARNACLE_EMAIL_KEY_PREFIX}:{}", hash_api_key(email))
+        }
         BarnacleKey::ApiKey(api_key) => {
             format!("{BARNACLE_API_KEY_PREFIX}:{}", hash_api_key(api_key))
         }

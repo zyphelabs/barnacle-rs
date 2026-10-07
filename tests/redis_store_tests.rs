@@ -185,6 +185,36 @@ async fn api_keys_are_not_stored_in_clear_text() {
 }
 
 #[tokio::test]
+async fn emails_are_not_stored_in_clear_text() {
+    let store = store();
+    let email = format!("{}@example.com", Uuid::new_v4());
+    let context = BarnacleContext {
+        key: BarnacleKey::Email(email.clone()),
+        path: "/test".into(),
+        method: "POST".into(),
+    };
+    store.increment(&context, &limit(5, 30)).await.unwrap();
+
+    let mut conn = connection().await;
+    let clear: Vec<String> = deadpool_redis::redis::cmd("KEYS")
+        .arg(format!("*{email}*"))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(clear.is_empty(), "found {clear:?}");
+    let hashed: Vec<String> = deadpool_redis::redis::cmd("KEYS")
+        .arg(format!(
+            "barnacle:email:{}:POST:/test",
+            hash_api_key(&email)
+        ))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(hashed.len(), 1);
+    store.reset(&context).await.unwrap();
+}
+
+#[tokio::test]
 async fn unreachable_redis_fails_fast_with_pool_timeouts() {
     let store = RedisBarnacleStore::from_url_with_options(
         "redis://10.255.255.1:6379",
