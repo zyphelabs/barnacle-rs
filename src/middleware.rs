@@ -28,7 +28,15 @@ use crate::types::{
     RateLimitScope, ResetOnSuccess, StoreFailurePolicy, NO_KEY,
 };
 use crate::BarnacleStore;
-use crate::RedisBarnacleStore;
+
+/// The store a layer uses when its type does not name one: the Redis store, else the fred
+/// store, else none (a crate built without either names its store).
+#[cfg(feature = "redis")]
+type DefaultStore = crate::RedisBarnacleStore;
+#[cfg(all(not(feature = "redis"), feature = "fred"))]
+type DefaultStore = crate::FredBarnacleStore;
+#[cfg(not(any(feature = "redis", feature = "fred")))]
+type DefaultStore = ();
 
 /// Bucket used to count failed API key validations per client IP.
 ///
@@ -154,7 +162,7 @@ struct Settings<State> {
 }
 
 /// Builder for [`BarnacleLayer`]
-pub struct BarnacleLayerBuilder<S = RedisBarnacleStore, State = ()> {
+pub struct BarnacleLayerBuilder<S = DefaultStore, State = ()> {
     store: Option<S>,
     limits: Option<Vec<Limit>>,
     state: Option<State>,
@@ -382,7 +390,7 @@ where
 ///
 /// `S` is the rate limit store, `State` the state passed to the API key validator,
 /// the request modifier and the identifier.
-pub struct BarnacleLayer<S = RedisBarnacleStore, State = ()> {
+pub struct BarnacleLayer<S = DefaultStore, State = ()> {
     store: S,
     settings: Arc<Settings<State>>,
 }
@@ -1226,7 +1234,7 @@ where
 }
 
 /// The service built by [`BarnacleLayer`]
-pub struct BarnacleMiddleware<Inner, S = RedisBarnacleStore, State = ()> {
+pub struct BarnacleMiddleware<Inner, S = DefaultStore, State = ()> {
     inner: Inner,
     store: S,
     settings: Arc<Settings<State>>,

@@ -16,6 +16,8 @@ exclude = [".changeset", ".github", "docs", "scripts", "knope.toml"]
 [features]
 default = ["redis"]
 redis = ["dep:redis", "dep:deadpool-redis"]
+# Redis store on the fred client: `FredBarnacleStore`
+fred = ["dep:fred"]
 
 [dependencies]
 axum = "0.8"
@@ -23,6 +25,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 redis = { version = "0.32", features = ["tokio-comp"], optional = true }
 deadpool-redis = { version = "0.22", features = [
     "rt_tokio_1",
+], optional = true }
+fred = { version = "10", default-features = false, features = [
+    "i-keys",
+    "i-scripts",
+    "sha-1",
 ], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
