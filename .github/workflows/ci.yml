@@ -45,8 +45,11 @@ jobs:
         run: cargo fmt --all --check
       - name: cargo check
         run: cargo check --all-targets --locked
+      # The library alone: the examples and most tests use the Redis store
+      - name: cargo check (fred only)
+        run: cargo check --lib --locked --no-default-features --features fred
       - name: cargo test
-        run: cargo test --locked
+        run: cargo test --locked --all-features
       - run: python3 -B -m unittest discover -s scripts -p 'test_*.py'
       - uses: knope-dev/action@19617851f9f13ab2f27a05989c55efb18aca3675 # v2.1.2
         with:

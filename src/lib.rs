@@ -49,7 +49,11 @@
 //! ```
 
 mod api_key_store;
+#[cfg(any(feature = "redis", feature = "fred"))]
+mod counters;
 mod error;
+#[cfg(feature = "fred")]
+mod fred_store;
 mod limits;
 mod middleware;
 mod redis_store;
@@ -75,6 +79,10 @@ pub use types::{
 // Redis-specific exports (only available with "redis" feature)
 #[cfg(feature = "redis")]
 pub use api_key_store::RedisApiKeyStore;
+#[cfg(feature = "fred")]
+pub use fred;
+#[cfg(feature = "fred")]
+pub use fred_store::{FredBarnacleStore, FredPoolOptions};
 #[cfg(feature = "redis")]
 pub use redis_store::{RedisBarnacleStore, RedisPoolOptions};
 // Re-export commonly used external dependencies (only with redis feature)

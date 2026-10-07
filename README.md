@@ -425,6 +425,30 @@ let store = RedisBarnacleStore::from_url_with_options(
 To bound how long a *request* waits, use `with_store_timeout` together with a
 `StoreFailurePolicy`, instead of pool timeouts short enough to break connecting.
 
+### fred store
+
+With the `fred` feature, `FredBarnacleStore` counts on a [fred](https://docs.rs/fred) pool
+instead of deadpool-redis, with the same keys and scripts: the two stores can share a Redis,
+and switching from one to the other keeps the counters. An application that already holds a
+fred pool hands it over, and the store opens no connection of its own:
+
+```toml
+barnacle-rs = { version = "0.5", default-features = false, features = ["fred"] }
+```
+
+```rust
+let store = FredBarnacleStore::new(pool.clone()); // a connected `fred::clients::Pool`
+let layer: BarnacleLayer<FredBarnacleStore> = BarnacleLayer::builder()
+    .with_store(store)
+    .build()?;
+```
+
+`FredBarnacleStore::from_url` opens a pool of its own with the default `FredPoolOptions`
+(4 connections, 5s to connect, 2s per command). A pool handed to `new` keeps its own
+settings: give it a command timeout, or use `with_store_timeout`, so a request does not wait
+for a reconnection. Without the `redis` feature, `BarnacleLayer` defaults to this store.
+There is no fred API key store yet: `RedisApiKeyStore` needs the `redis` feature.
+
 ## Identifying requests by principal
 
 An identifier decides who a request is counted for, and with which limits. It reads the
