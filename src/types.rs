@@ -68,8 +68,8 @@ impl ResetOnSuccess {
 
 /// Identification key for rate limiting (e.g., email, api-key, IP)
 ///
-/// The `Debug` output of [`BarnacleKey::ApiKey`] is redacted so that API keys
-/// never end up in logs in clear text.
+/// The `Debug` output of [`BarnacleKey::ApiKey`] and [`BarnacleKey::Email`] is redacted so
+/// that API keys and email addresses never end up in logs in clear text.
 #[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BarnacleKey {
     Email(String),
@@ -81,7 +81,10 @@ pub enum BarnacleKey {
 impl std::fmt::Debug for BarnacleKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BarnacleKey::Email(email) => f.debug_tuple("Email").field(email).finish(),
+            BarnacleKey::Email(email) => f
+                .debug_tuple("Email")
+                .field(&redact_api_key(email))
+                .finish(),
             BarnacleKey::ApiKey(api_key) => f
                 .debug_tuple("ApiKey")
                 .field(&redact_api_key(api_key))
